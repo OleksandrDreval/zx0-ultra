@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+Third-Party Credits & Acknowledgments:
+-------------------------------------------------------------------------------
+- ZX0 algorithm & reference implementation by Einar Saukas (BSD 3-Clause).
+  Full text available in LICENSES/LICENSE-ZX0-BSD.txt
+
+- Reference x86-16 decompressor architecture by Emmanuel Marty (zlib License).
+  Full text available in LICENSES/LICENSE-UNZX0-ZLIB.txt
