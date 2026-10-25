@@ -1,0 +1,6 @@
+[submodule "third_party/ZX0-main"]
+	path = third_party/ZX0-main
+	url = https://github.com/einar-saukas/ZX0.git
+[submodule "third_party/unzx0_x86-main"]
+	path = third_party/unzx0_x86-main
+	url = https://github.com/emmanuel-marty/unzx0_x86.git
