@@ -1,0 +1,10 @@
+*.diff
+
+*.com
+*.exe
+*.lst
+*.pyc
+
+*.png
+
+*.md
