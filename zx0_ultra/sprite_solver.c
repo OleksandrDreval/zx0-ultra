@@ -13,10 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_PACK_ASSETS             12
-#define ELITE_BYTE_SLACK            4
-#define MAX_ELITE_PERMUTATIONS      256
-#define MAX_WILDCARD_BRIDGE_LEN     4
+#define MAX_PACK_ASSETS                 14
+#define EXACT_FACTORIAL_ASSET_LIMIT     8
+#define MAX_HEURISTIC_PERMUTATIONS      768
+#define ELITE_BYTE_SLACK                4
+#define MAX_ELITE_PERMUTATIONS          256
+#define MAX_WILDCARD_BRIDGE_LEN         4
 
 static int compute_max_overlap(const UltraAsset *left, const UltraAsset *right) {
     int limit = left->length < right->length ? left->length : right->length;
@@ -180,6 +182,156 @@ static void update_global_best(
     }
 }
 
+static void append_unique_perm(
+    int (*perms)[MAX_PACK_ASSETS],
+    size_t *count_io,
+    size_t max_cap,
+    const int *cand,
+    int active_count
+) {
+    if (*count_io >= max_cap) {
+        return;
+    }
+    size_t bytes = (size_t)active_count * sizeof(int);
+    for (size_t i = 0; i < *count_io; i++) {
+        if (memcmp(perms[i], cand, bytes) == 0) {
+            return;
+        }
+    }
+    memcpy(perms[*count_io], cand, bytes);
+    (*count_io)++;
+}
+
+static void expand_tour_neighborhood(
+    const int *seed_tour,
+    int active_count,
+    int (*perms)[MAX_PACK_ASSETS],
+    size_t *count_io,
+    size_t max_cap
+) {
+    int tmp[MAX_PACK_ASSETS];
+    /* 1. All 2-opt segment reversals */
+    for (int i = 0; i < active_count - 1 && *count_io < max_cap; i++) {
+        for (int j = i + 1; j < active_count && *count_io < max_cap; j++) {
+            memcpy(tmp, seed_tour, (size_t)active_count * sizeof(int));
+            int l = i, r = j;
+            while (l < r) {
+                int s = tmp[l];
+                tmp[l++] = tmp[r];
+                tmp[r--] = s;
+            }
+            append_unique_perm(perms, count_io, max_cap, tmp, active_count);
+        }
+    }
+    /* 2. All single-asset relocations (remove at src, insert at dst) */
+    for (int src = 0; src < active_count && *count_io < max_cap; src++) {
+        for (int dst = 0; dst < active_count && *count_io < max_cap; dst++) {
+            if (src == dst) {
+                continue;
+            }
+            int val = seed_tour[src];
+            int p = 0;
+            for (int k = 0; k < active_count; k++) {
+                if (k == src) {
+                    continue;
+                }
+                if (p == dst) {
+                    tmp[p++] = val;
+                }
+                tmp[p++] = seed_tour[k];
+            }
+            if (p == dst) {
+                tmp[p++] = val;
+            }
+            append_unique_perm(perms, count_io, max_cap, tmp, active_count);
+        }
+    }
+}
+
+/*
+ * Exact Held-Karp Bitmask DP (O(K^2 * 2^K)) for Maximum-Weight Hamiltonian Paths.
+ * Extracts the globally optimal tour plus per-endpoint optimal Hamiltonian paths.
+ */
+static void append_held_karp_tours(
+    const int *active_ids,
+    int active_count,
+    const int weight[MAX_PACK_ASSETS][MAX_PACK_ASSETS],
+    int (*perms)[MAX_PACK_ASSETS],
+    size_t *count_io,
+    size_t max_cap,
+    int best_tour_out[MAX_PACK_ASSETS]
+) {
+    int num_masks = 1 << active_count;
+    size_t table_entries = (size_t)num_masks * (size_t)active_count;
+    int *dp = (int *)malloc(table_entries * sizeof(int));
+    int *parent = (int *)malloc(table_entries * sizeof(int));
+    assert(dp != NULL && parent != NULL);
+
+    for (size_t idx = 0; idx < table_entries; idx++) {
+        dp[idx] = -1000000000;
+        parent[idx] = -1;
+    }
+    for (int v = 0; v < active_count; v++) {
+        dp[((size_t)(1 << v) * (size_t)active_count) + (size_t)v] = 0;
+    }
+
+    for (int mask = 1; mask < num_masks; mask++) {
+        for (int u = 0; u < active_count; u++) {
+            if ((mask & (1 << u)) == 0) {
+                continue;
+            }
+            int cur_score = dp[(size_t)mask * (size_t)active_count + (size_t)u];
+            if (cur_score <= -500000000) {
+                continue;
+            }
+            for (int v = 0; v < active_count; v++) {
+                if ((mask & (1 << v)) != 0) {
+                    continue;
+                }
+                int nmask = mask | (1 << v);
+                int cand = cur_score + weight[u][v];
+                size_t nidx = (size_t)nmask * (size_t)active_count + (size_t)v;
+                if (cand > dp[nidx]) {
+                    dp[nidx] = cand;
+                    parent[nidx] = u;
+                }
+            }
+        }
+    }
+
+    int full_mask = num_masks - 1;
+    int best_end = 0;
+    int best_score = -1000000000;
+    for (int v = 0; v < active_count; v++) {
+        int sc = dp[(size_t)full_mask * (size_t)active_count + (size_t)v];
+        if (sc > best_score) {
+            best_score = sc;
+            best_end = v;
+        }
+    }
+
+    /* Reconstruct global best tour first, then all endpoint-optimal tours */
+    for (int pass = 0; pass <= active_count; pass++) {
+        int end_v = (pass == 0) ? best_end : (pass - 1);
+        int tour[MAX_PACK_ASSETS];
+        int cur_mask = full_mask;
+        int cur_v = end_v;
+        for (int pos = active_count - 1; pos >= 0; pos--) {
+            tour[pos] = active_ids[cur_v];
+            int prev_v = parent[(size_t)cur_mask * (size_t)active_count + (size_t)cur_v];
+            cur_mask ^= (1 << cur_v);
+            cur_v = prev_v;
+        }
+        if (pass == 0) {
+            memcpy(best_tour_out, tour, (size_t)active_count * sizeof(int));
+        }
+        append_unique_perm(perms, count_io, max_cap, tour, active_count);
+    }
+
+    free(parent);
+    free(dp);
+}
+
 int ultra_solve_multi_asset_pack(
     const UltraAsset *assets,
     int asset_count,
@@ -236,23 +388,109 @@ int ultra_solve_multi_asset_pack(
         }
     }
 
-    /* Enumerate all permutations of active_ids */
-    size_t total_perms = 1;
-    for (int k = 2; k <= active_count; k++) {
-        total_perms *= (size_t)k;
-    }
-    int (*all_perms)[MAX_PACK_ASSETS] = malloc(total_perms * sizeof(*all_perms));
-    PermScore *perm_scores = (PermScore *)malloc(total_perms * sizeof(PermScore));
-    assert(all_perms != NULL && perm_scores != NULL);
+    /*
+     * Enumerate candidate permutations of active_ids:
+     * - Exact exhaustive K! enumeration when active_count <= EXACT_FACTORIAL_ASSET_LIMIT (<= 40,320)
+     * - Exact Held-Karp Bitmask ATSP (Pairwise ZX0 Bit-Gain + Superstring Overlap) + 2-Opt/Relocation
+     *   neighborhood when active_count > EXACT_FACTORIAL_ASSET_LIMIT (up to 14 assets without factorial OOM)
+     */
+    size_t total_perms = 0;
+    int (*all_perms)[MAX_PACK_ASSETS] = NULL;
 
-    int cur_perm[MAX_PACK_ASSETS];
-    memcpy(cur_perm, active_ids, (size_t)active_count * sizeof(int));
-    size_t p_idx = 0;
-    do {
-        memcpy(all_perms[p_idx], cur_perm, (size_t)active_count * sizeof(int));
-        p_idx++;
-    } while (next_lexicographic_permutation(cur_perm, active_count));
-    assert(p_idx == total_perms);
+    if (active_count <= EXACT_FACTORIAL_ASSET_LIMIT) {
+        total_perms = 1;
+        for (int k = 2; k <= active_count; k++) {
+            total_perms *= (size_t)k;
+        }
+        all_perms = malloc(total_perms * sizeof(*all_perms));
+        assert(all_perms != NULL);
+
+        int cur_perm[MAX_PACK_ASSETS];
+        memcpy(cur_perm, active_ids, (size_t)active_count * sizeof(int));
+        size_t p_idx = 0;
+        do {
+            memcpy(all_perms[p_idx], cur_perm, (size_t)active_count * sizeof(int));
+            p_idx++;
+        } while (next_lexicographic_permutation(cur_perm, active_count));
+        assert(p_idx == total_perms);
+    } else {
+        all_perms = malloc(MAX_HEURISTIC_PERMUTATIONS * sizeof(*all_perms));
+        assert(all_perms != NULL);
+
+        int solo_bits[MAX_PACK_ASSETS] = {0};
+        for (int u = 0; u < active_count; u++) {
+            int aid = active_ids[u];
+            size_t csz = 0;
+            UltraMetadata smeta;
+            uint8_t *cstream = ultra_compress_buffer(
+                assets[aid].data, assets[aid].length, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &csz, &smeta, NULL
+            );
+            free(cstream);
+            solo_bits[u] = smeta.compressed_bits;
+        }
+
+        int ov_weight[MAX_PACK_ASSETS][MAX_PACK_ASSETS];
+        int lz_weight[MAX_PACK_ASSETS][MAX_PACK_ASSETS];
+        memset(ov_weight, 0, sizeof(ov_weight));
+        memset(lz_weight, 0, sizeof(lz_weight));
+
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int pair_idx = 0; pair_idx < active_count * active_count; pair_idx++) {
+            int u = pair_idx / active_count;
+            int v = pair_idx % active_count;
+            if (u == v) {
+                continue;
+            }
+            int id_u = active_ids[u];
+            int id_v = active_ids[v];
+            int ov = max_ov_table[id_u][id_v];
+            ov_weight[u][v] = ov;
+
+            int pair_perm[2] = {id_u, id_v};
+            int pair_gap[1] = {ov};
+            int pair_offs[2] = {0, 0};
+            int cap = assets[id_u].length + assets[id_v].length + 4;
+            uint8_t *p_raw = (uint8_t *)malloc((size_t)cap);
+            uint8_t *p_wc = (uint8_t *)malloc((size_t)cap);
+            assert(p_raw != NULL && p_wc != NULL);
+
+            int plen = build_candidate_buffer(assets, pair_perm, 2, pair_gap, p_raw, p_wc, pair_offs);
+            size_t pcsz = 0;
+            UltraMetadata pmeta;
+            uint8_t *pstream = ultra_compress_buffer(
+                p_raw, plen, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &pcsz, &pmeta, NULL
+            );
+            free(pstream);
+            free(p_wc);
+            free(p_raw);
+
+            /* Add ZX0 EOF overhead back out so pairwise bit gain is strictly positive on helpful edges */
+            int saved_bits = (solo_bits[u] + solo_bits[v] - 18) - pmeta.compressed_bits;
+            lz_weight[u][v] = (saved_bits > 0 ? saved_bits * 4 : 0) + ov;
+        }
+
+        int best_lz_tour[MAX_PACK_ASSETS];
+        int best_ov_tour[MAX_PACK_ASSETS];
+        append_held_karp_tours(
+            active_ids, active_count, lz_weight, all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS, best_lz_tour
+        );
+        append_held_karp_tours(
+            active_ids, active_count, ov_weight, all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS, best_ov_tour
+        );
+        append_unique_perm(all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS, active_ids, active_count);
+
+        int rev_ids[MAX_PACK_ASSETS];
+        for (int i = 0; i < active_count; i++) {
+            rev_ids[i] = active_ids[active_count - 1 - i];
+        }
+        append_unique_perm(all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS, rev_ids, active_count);
+
+        expand_tour_neighborhood(best_lz_tour, active_count, all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS);
+        expand_tour_neighborhood(best_ov_tour, active_count, all_perms, &total_perms, MAX_HEURISTIC_PERMUTATIONS);
+    }
+
+    PermScore *perm_scores = (PermScore *)malloc(total_perms * sizeof(PermScore));
+    assert(perm_scores != NULL);
 
     /*
      * Phase 1: Parallel screening of all permutations (both maximal-overlap and zero-overlap).

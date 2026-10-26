@@ -65,10 +65,11 @@ static int write_entire_file(const char *path, const uint8_t *data, size_t size)
 static const char *format_label(UltraFormat fmt) {
     switch (fmt) {
         case ULTRA_FORMAT_ZX0_V2:     return "ZX0-v2 (67B/70B compat)";
-        case ULTRA_FORMAT_ADPK_77B:   return "ADPK-78B (Adaptive-k)";
+        case ULTRA_FORMAT_ADPK_77B:   return "ADPK-78B (Adaptive-k 1..12)";
         case ULTRA_FORMAT_STRD_80B:   return "STRD-80B (Order-1 Stride)";
         case ULTRA_FORMAT_STRD_82B:   return "STRD-82B (Order-M Stride)";
         case ULTRA_FORMAT_COMPAT_82B: return "COMPAT-82B (0B-Ovh + Stride)";
+        case ULTRA_FORMAT_X86E8_84B:  return "X86E8-84B (0B-Ovh + E8 Call)";
         default:                      return "Unknown";
     }
 }
@@ -82,13 +83,16 @@ static void print_usage(const char *prog) {
         "  %s --pack [format_flag] [--no-wildcards] -o <output.zx0u> [--raw-out <layout.bin>] <asset1> <asset2> ...\n"
         "\nFormat flags:\n"
         "  --zx0       Standard ZX0 v2 bitstream (default; 100%% compatible with 67B/70B unzx0_x86.asm)\n"
-        "  --adpk77    Adaptive k-bit offset LSB bitstream (78-byte unzx0_adpk_77b.asm)\n"
+        "  --adpk77    Adaptive k-bit (k=1..12) offset LSB bitstream (78-byte unzx0_adpk_77b.asm)\n"
         "  --strd80    1st-order arbitrary 16-bit Stride-Delta post-filter (80-byte unzx0_strd_80b.asm)\n"
         "  --compat82  Zero-overhead ZX0-compatible + Order-1 Stride-Delta (82-byte unzx0_compat_82b.asm)\n"
-        "  --strd82    Multi-pass Order-1..5 Stride-Delta post-filter (82-byte unzx0_strd_82b.asm)\n",
+        "  --strd82    Multi-pass Order-1..5 Stride-Delta post-filter (82-byte unzx0_strd_82b.asm)\n"
+        "  --x86e8     Zero-overhead ZX0-compatible + x86 E8 Call-Target filter (84-byte unzx0_x86e8_84b.asm)\n",
         prog, prog, prog
     );
 }
+
+#define CLI_MAX_PACK_ASSETS 14
 
 static int handle_pack_command(
     UltraFormat format,
@@ -98,13 +102,14 @@ static int handle_pack_command(
     char **asset_paths,
     int asset_count
 ) {
-    if (asset_count < 1 || asset_count > 12 || out_comp_path == NULL) {
-        fprintf(stderr, "Error: --pack requires -o <output> and between 1 and 12 asset files\n");
+    if (asset_count < 1 || asset_count > CLI_MAX_PACK_ASSETS || out_comp_path == NULL) {
+        fprintf(stderr, "Error: --pack requires -o <output> and between 1 and %d asset files\n",
+                CLI_MAX_PACK_ASSETS);
         return 1;
     }
 
-    UltraAsset assets[12];
-    uint8_t *buffers[12] = {NULL};
+    UltraAsset assets[CLI_MAX_PACK_ASSETS];
+    uint8_t *buffers[CLI_MAX_PACK_ASSETS] = {NULL};
 
     for (int i = 0; i < asset_count; i++) {
         size_t sz = 0;
@@ -144,9 +149,11 @@ static int handle_pack_command(
            sum_raw, sol.total_uncompressed_size, sol.compressed_size, sol.metadata.compressed_bits);
     if (format == ULTRA_FORMAT_ADPK_77B) {
         printf("  Selected offset_lsb_bits (k): %d\n", sol.metadata.offset_lsb_bits);
+    } else if (format == ULTRA_FORMAT_X86E8_84B && sol.metadata.filter_passes > 0) {
+        printf("  Selected x86 E8 Call-Target tail: %d B\n", sol.metadata.filter_counts[0]);
     } else if (sol.metadata.filter_passes > 0) {
-        printf("  Selected Stride-Delta: passes=%d, stride=%d\n",
-               sol.metadata.filter_passes, sol.metadata.filter_stride);
+        printf("  Selected Stride-Delta: passes=%d, stride=%d, tail=%d B\n",
+               sol.metadata.filter_passes, sol.metadata.filter_stride, sol.metadata.filter_counts[0]);
     }
     for (int i = 0; i < asset_count; i++) {
         printf("  Asset[%d] %-28s : offset +%4d (0x%03X), len %3d B\n",
@@ -184,7 +191,7 @@ int main(int argc, char **argv) {
     const char *pack_out_path = NULL;
     const char *pack_raw_out_path = NULL;
 
-    char *positional[16];
+    char *positional[20];
     int pos_count = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -198,6 +205,8 @@ int main(int argc, char **argv) {
             format = ULTRA_FORMAT_COMPAT_82B;
         } else if (strcmp(argv[i], "--strd82") == 0) {
             format = ULTRA_FORMAT_STRD_82B;
+        } else if (strcmp(argv[i], "--x86e8") == 0) {
+            format = ULTRA_FORMAT_X86E8_84B;
         } else if (strcmp(argv[i], "--decompress") == 0 || strcmp(argv[i], "-d") == 0) {
             decompress_mode = 1;
         } else if (strcmp(argv[i], "--pack") == 0) {
@@ -215,7 +224,7 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 1;
         } else {
-            if (pos_count < 16) {
+            if (pos_count < 20) {
                 positional[pos_count++] = argv[i];
             }
         }
@@ -276,8 +285,10 @@ int main(int argc, char **argv) {
            meta.compressed_bits, elapsed);
     if (format == ULTRA_FORMAT_ADPK_77B) {
         printf(" [k=%d]", meta.offset_lsb_bits);
+    } else if (format == ULTRA_FORMAT_X86E8_84B && meta.filter_passes > 0) {
+        printf(" [e8_tail=%d]", meta.filter_counts[0]);
     } else if (meta.filter_passes > 0) {
-        printf(" [stride=%d, passes=%d]", meta.filter_stride, meta.filter_passes);
+        printf(" [stride=%d, passes=%d, tail=%d]", meta.filter_stride, meta.filter_passes, meta.filter_counts[0]);
     }
     printf("\n");
 
