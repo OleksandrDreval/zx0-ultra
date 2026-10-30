@@ -1,6 +1,6 @@
 # zx0-ultra
 
-Exact multi-threaded ZX0 compressor and a family of 16-bit x86 real-mode (67–84 bytes) decompressors.
+Exact multi-threaded ZX0 compressor and a family of 16-bit x86 real-mode (67–108 bytes) decompressors.
 
 ## Build
 

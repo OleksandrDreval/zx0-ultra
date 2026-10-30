@@ -31,6 +31,7 @@ static inline int omp_in_parallel(void) { return 0; }
 #define MAX_ADPK_LSB_BITS           12
 #define MIN_MATCH_LENGTH_NEW_OFFSET 2
 #define X86_OPCODE_CALL_REL16       0xE8
+#define X86_OPCODE_JMP_REL16        0xE9
 
 typedef struct {
     int prev_node;
@@ -717,17 +718,17 @@ static uint8_t *encode_plan_to_stream(
         }
     }
 
-    /* Emit ZX0 end-of-stream marker (COMPAT_82B & X86E8_84B use V=257; UNIV_93B uses V=257 for Stride or V=281 for E8) */
+    /* Emit ZX0 end-of-stream marker (COMPAT_82B & X86E8_84B use V=257; UNIV_93B & HYBRID_108B use V=257 for Stride or V=281 for E8) */
     bit_writer_put_bit(&bw, 1);
     int eof_symbol = ZX0_EOF_MSB_VALUE;
     if ((format == ULTRA_FORMAT_COMPAT_82B || format == ULTRA_FORMAT_X86E8_84B) && meta->filter_passes > 0) {
         eof_symbol = ZX0_EOF_ALT_VALUE;
-    } else if (format == ULTRA_FORMAT_UNIV_93B && meta->filter_passes > 0) {
+    } else if ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B) && meta->filter_passes > 0) {
         eof_symbol = (meta->filter_stride == 0) ? ZX0_EOF_E8_VALUE : ZX0_EOF_ALT_VALUE;
     }
     bit_writer_put_elias(&bw, eof_symbol, 1);
 
-    /* Emit post-filter control words for STRD_80B, STRD_82B, COMPAT_82B, X86E8_84B, and UNIV_93B */
+    /* Emit post-filter control words for STRD_80B, STRD_82B, COMPAT_82B, X86E8_84B, UNIV_93B, and HYBRID_108B */
     if (format == ULTRA_FORMAT_STRD_80B) {
         uint16_t count_word = (meta->filter_passes > 0) ? (uint16_t)meta->filter_counts[0] : 0;
         bit_writer_put_u16_le(&bw, count_word);
@@ -746,6 +747,17 @@ static uint8_t *encode_plan_to_stream(
             bit_writer_put_u16_le(&bw, (uint16_t)meta->filter_counts[p]);
         }
         bit_writer_put_u16_le(&bw, 0);
+    } else if (format == ULTRA_FORMAT_HYBRID_108B) {
+        if (meta->filter_passes > 0) {
+            for (int p = 0; p < meta->filter_passes; p++) {
+                bit_writer_put_u16_le(&bw, (uint16_t)meta->filter_counts[p]);
+                int st = meta->filter_strides[p];
+                if (st > 0) {
+                    bit_writer_put_byte(&bw, (uint8_t)((256 - st) & 0xFF));
+                }
+            }
+            bit_writer_put_u16_le(&bw, 0);
+        }
     }
 
     *out_size = bw.size;
@@ -1008,6 +1020,55 @@ reached_eof:
                 out[di] = (uint8_t)(out[di] + out[di - (size_t)last_offset]);
             }
         }
+    } else if (format == ULTRA_FORMAT_HYBRID_108B && eof_msb_read > ZX0_EOF_MSB_VALUE) {
+        int e8_stage = (eof_msb_read == ZX0_EOF_E8_VALUE) ? 2 : 0;
+        for (;;) {
+            if (br.index + FILTER_WORD_BYTES > br.size) {
+                free(out);
+                return NULL;
+            }
+            uint16_t count = (uint16_t)(br.data[br.index] | (br.data[br.index + 1] << 8));
+            br.index += FILTER_WORD_BYTES;
+            if (count == 0) {
+                break;
+            }
+            if (e8_stage > 0) {
+                uint8_t target_op = (e8_stage == 2) ? X86_OPCODE_CALL_REL16 : X86_OPCODE_JMP_REL16;
+                e8_stage--;
+                if ((size_t)count > out_pos) {
+                    free(out);
+                    return NULL;
+                }
+                size_t di = out_pos - (size_t)count;
+                for (uint32_t rem = count; rem > 0; rem--, di++) {
+                    if (out[di] == target_op) {
+                        if (di + 2 >= out_pos) {
+                            free(out);
+                            return NULL;
+                        }
+                        uint16_t rel = (uint16_t)(out[di + 1] | (out[di + 2] << 8));
+                        rel = (uint16_t)(rel + (uint16_t)rem);
+                        out[di + 1] = (uint8_t)(rel & 0xFF);
+                        out[di + 2] = (uint8_t)((rel >> 8) & 0xFF);
+                    }
+                }
+            } else {
+                int neg_b = bit_reader_get_byte(&br);
+                if (neg_b < 0) {
+                    free(out);
+                    return NULL;
+                }
+                int stride = 256 - neg_b;
+                if ((size_t)count + (size_t)stride > out_pos) {
+                    free(out);
+                    return NULL;
+                }
+                size_t di = out_pos - (size_t)count;
+                for (uint16_t c = 0; c < count; c++, di++) {
+                    out[di] = (uint8_t)(out[di] + out[di - (size_t)stride]);
+                }
+            }
+        }
     }
 
     if (br.index != br.size) {
@@ -1032,15 +1093,17 @@ static void apply_forward_stride_difference(
 }
 
 /*
- * O(N) Kadane suffix-gain scan to locate an optimal piecewise tail boundary [input_size - count .. input_size)
+ * O(N) Kadane suffix-gain scan to locate optimal piecewise tail boundaries [input_size - count .. input_size)
  * where Stride-Delta increases local byte predictability without corrupting an earlier code/header prefix.
- * Detects both cross-byte constant deltas (d_cur == d_prv) and same-channel linear ramps (d_cur == d_stride_prev).
+ * Detects cross-byte constant deltas (d_cur == d_prv), same-channel linear ramps (d_cur == d_stride_prev),
+ * and smooth 2nd-order derivatives (dd in {-1, 0, +1}), plus an unbiased Kadane variant for hybrid ROMs.
  */
 static int find_optimal_stride_tail_count(
     const uint8_t *src,
     int input_size,
     int stride,
-    int *best_gain_out
+    int *best_gain_out,
+    int *unbiased_tail_out
 ) {
     int max_tail = input_size - stride;
     if (max_tail > 65535) {
@@ -1048,6 +1111,9 @@ static int find_optimal_stride_tail_count(
     }
     if (max_tail <= stride) {
         *best_gain_out = 0;
+        if (unbiased_tail_out != NULL) {
+            *unbiased_tail_out = 0;
+        }
         return 0;
     }
 
@@ -1055,6 +1121,9 @@ static int find_optimal_stride_tail_count(
     int suffix_gain = 0;
     int best_gain = 0;
     int best_tail = 0;
+    int unbiased_gain = 0;
+    int best_unbiased_gain = 0;
+    int best_unbiased_tail = 0;
 
     for (int i = input_size - 1; i >= min_idx; i--) {
         int raw_hit = (src[i] == 0 || src[i] == src[i - 1] || src[i] == src[i - stride]) ? 1 : 0;
@@ -1068,7 +1137,8 @@ static int find_optimal_stride_tail_count(
         }
         if (!dif_hit && i >= 2 * stride) {
             uint8_t d_str = (uint8_t)(src[i - stride] - src[i - 2 * stride]);
-            if (d_cur == d_str) {
+            uint8_t dd = (uint8_t)(d_cur - d_str);
+            if (dd == 0 || dd == 1 || dd == 255) {
                 dif_hit = 1;
             }
         }
@@ -1078,28 +1148,35 @@ static int find_optimal_stride_tail_count(
             best_gain = suffix_gain;
             best_tail = input_size - i;
         }
+        unbiased_gain += 2 * (dif_hit - raw_hit);
+        if (unbiased_gain > best_unbiased_gain) {
+            best_unbiased_gain = unbiased_gain;
+            best_unbiased_tail = input_size - i;
+        }
     }
 
     *best_gain_out = best_gain;
+    if (unbiased_tail_out != NULL) {
+        *unbiased_tail_out = best_unbiased_tail;
+    }
     return best_tail;
 }
 
 /*
- * Exact backward inverse of unzx0_x86e8_84b.asm / unzx0_univ_93b.asm forward scasb/add [di],cx loop.
- * Because each step inspects byte[i] and modifies only byte[i+1..i+2], reversing the order
- * from i = input_size - 3 down to start_idx forms a strict bijection even across adjacent 0xE8 bytes.
+ * Exact backward inverse of unzx0_x86e8_84b.asm / unzx0_univ_93b.asm / unzx0_hybrid_108b.asm
+ * forward scasb/add [di],cx loop for 0xE8 (CALL rel16) or 0xE9 (JMP rel16).
  */
-static int apply_forward_x86_e8_filter(
+static int apply_forward_x86_opcode_filter(
     const uint8_t *src,
     uint8_t *dst,
     int input_size,
-    int tail_count
+    int tail_count,
+    uint8_t target_op
 ) {
     if (input_size < 3 || tail_count < 3 || tail_count > input_size || tail_count > 65535) {
         return 0;
     }
-    if (src[input_size - 2] == X86_OPCODE_CALL_REL16 ||
-        src[input_size - 1] == X86_OPCODE_CALL_REL16) {
+    if (src[input_size - 2] == target_op || src[input_size - 1] == target_op) {
         return 0;
     }
 
@@ -1108,7 +1185,7 @@ static int apply_forward_x86_e8_filter(
     int hits = 0;
 
     for (int i = input_size - 3; i >= start_idx; i--) {
-        if (dst[i] == X86_OPCODE_CALL_REL16) {
+        if (dst[i] == target_op) {
             uint16_t rem = (uint16_t)(tail_count - (i - start_idx));
             uint16_t rel = (uint16_t)(dst[i + 1] | (dst[i + 2] << 8));
             rel = (uint16_t)(rel - rem);
@@ -1210,11 +1287,12 @@ uint8_t *ultra_compress_buffer(
     } else {
         /*
          * Unified Post-Filter Search for:
-         * - ULTRA_FORMAT_X86E8_84B (Zero-overhead ZX0 + E8 Call-Target filter)
-         * - ULTRA_FORMAT_STRD_80B  (16-bit Stride-Delta filter)
+         * - ULTRA_FORMAT_X86E8_84B  (Zero-overhead ZX0 + E8 Call-Target filter)
+         * - ULTRA_FORMAT_STRD_80B   (16-bit Stride-Delta filter)
          * - ULTRA_FORMAT_COMPAT_82B (Zero-overhead ZX0 + 16-bit Stride-Delta filter)
-         * - ULTRA_FORMAT_STRD_82B  (Multi-pass Order-1..5 Stride-Delta filter)
-         * - ULTRA_FORMAT_UNIV_93B  (Universal Zero-overhead ZX0 + 16-bit Stride-Delta + E8 Call-Target)
+         * - ULTRA_FORMAT_STRD_82B   (Multi-pass Order-1..5 Stride-Delta filter)
+         * - ULTRA_FORMAT_UNIV_93B   (Universal Zero-overhead ZX0 + 16-bit Stride-Delta + E8 Call-Target)
+         * - ULTRA_FORMAT_HYBRID_108B (Multi-Stage 0B-Ovh ZX0 + E8/E9 + Free-BX Multi-Stride 2D filter)
          */
         int base_payload_bits = 0;
         {
@@ -1227,13 +1305,16 @@ uint8_t *ultra_compress_buffer(
             free(base_plan.tokens);
         }
 
-        /* A. Evaluate position-independent x86 E8 Call-Target transform (X86E8_84B and UNIV_93B) */
-        if ((format == ULTRA_FORMAT_X86E8_84B || format == ULTRA_FORMAT_UNIV_93B) &&
+        uint8_t *best_e8_buf = NULL;
+        int best_e8_tail_chosen = 0;
+
+        /* A. Evaluate position-independent x86 E8 Call-Target transform (X86E8_84B, UNIV_93B, HYBRID_108B) */
+        if ((format == ULTRA_FORMAT_X86E8_84B || format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B) &&
             input_size >= 3 &&
             working_input[input_size - 2] != X86_OPCODE_CALL_REL16 &&
             working_input[input_size - 1] != X86_OPCODE_CALL_REL16) {
             int full_tail = input_size <= 65535 ? input_size : 65535;
-            int cand_tails[3];
+            int cand_tails[6];
             int num_tails = 0;
             cand_tails[num_tails++] = full_tail;
 
@@ -1249,16 +1330,17 @@ uint8_t *ultra_compress_buffer(
                     }
                 }
             }
-            for (int i = min_scan_idx; i <= input_size - 3; i++) {
+            int seen_e8 = 0;
+            for (int i = min_scan_idx; i <= input_size - 3 && seen_e8 < 4; i++) {
                 if (working_input[i] == X86_OPCODE_CALL_REL16) {
                     uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
                     uint16_t tword = (uint16_t)((working_input[i + 1] | (working_input[i + 2] << 8)) - rem);
                     if (target_freq[tword] >= 2) {
                         int repeated_tail = input_size - i;
-                        if (repeated_tail >= 3 && repeated_tail < full_tail - 32) {
+                        if (repeated_tail >= 3 && repeated_tail < full_tail - 8 && num_tails < 5) {
                             cand_tails[num_tails++] = repeated_tail;
                         }
-                        break;
+                        seen_e8++;
                     }
                 }
             }
@@ -1285,19 +1367,20 @@ uint8_t *ultra_compress_buffer(
                         dup = 1;
                     }
                 }
-                if (!dup && num_tails < 3) {
+                if (!dup && num_tails < 6) {
                     cand_tails[num_tails++] = best_e8_tail;
                 }
             }
             free(target_freq);
 
+            size_t best_e8_only_size = best_size;
             int nested_parallel = omp_in_parallel();
             #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
             for (int ti = 0; ti < num_tails; ti++) {
                 int tail_count = cand_tails[ti];
                 uint8_t *e8_buf = (uint8_t *)malloc((size_t)input_size);
                 assert(e8_buf != NULL);
-                int hits = apply_forward_x86_e8_filter(working_input, e8_buf, input_size, tail_count);
+                int hits = apply_forward_x86_opcode_filter(working_input, e8_buf, input_size, tail_count, X86_OPCODE_CALL_REL16);
                 if (hits >= 2) {
                     ParsePlan plan_e8 = {NULL, 0, 0};
                     if (solve_exact_parse(e8_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan_e8)) {
@@ -1307,6 +1390,7 @@ uint8_t *ultra_compress_buffer(
                         meta_e8.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
                         meta_e8.filter_passes = 1;
                         meta_e8.filter_stride = 0;
+                        meta_e8.filter_strides[0] = 0;
                         meta_e8.filter_counts[0] = tail_count;
                         meta_e8.compressed_bits = plan_e8.payload_bits;
 
@@ -1327,14 +1411,66 @@ uint8_t *ultra_compress_buffer(
                             } else {
                                 free(stream_e8);
                             }
+                            if (size_e8 < best_e8_only_size) {
+                                best_e8_only_size = size_e8;
+                                free(best_e8_buf);
+                                best_e8_buf = (uint8_t *)malloc((size_t)input_size);
+                                memcpy(best_e8_buf, e8_buf, (size_t)input_size);
+                                best_e8_tail_chosen = tail_count;
+                            }
                         }
+                    }
+
+                    /* For HYBRID_108B: also evaluate chaining E8 (CALL rel16) + E9 (JMP rel16) */
+                    if (format == ULTRA_FORMAT_HYBRID_108B &&
+                        e8_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
+                        e8_buf[input_size - 1] != X86_OPCODE_JMP_REL16) {
+                        uint8_t *e8e9_buf = (uint8_t *)malloc((size_t)input_size);
+                        assert(e8e9_buf != NULL);
+                        int hits_e9 = apply_forward_x86_opcode_filter(e8_buf, e8e9_buf, input_size, tail_count, X86_OPCODE_JMP_REL16);
+                        if (hits_e9 >= 2) {
+                            ParsePlan plan_e89 = {NULL, 0, 0};
+                            if (solve_exact_parse(e8e9_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan_e89)) {
+                                UltraMetadata meta_e89;
+                                memset(&meta_e89, 0, sizeof(meta_e89));
+                                meta_e89.format = format;
+                                meta_e89.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                                meta_e89.filter_passes = 2;
+                                meta_e89.filter_stride = 0;
+                                meta_e89.filter_strides[0] = 0;
+                                meta_e89.filter_strides[1] = 0;
+                                meta_e89.filter_counts[0] = tail_count;
+                                meta_e89.filter_counts[1] = tail_count;
+                                meta_e89.compressed_bits = plan_e89.payload_bits;
+
+                                size_t size_e89 = 0;
+                                uint8_t *stream_e89 = encode_plan_to_stream(
+                                    e8e9_buf, &plan_e89, format, ZX0_DEFAULT_LSB_BITS, &meta_e89, &size_e89
+                                );
+                                free(plan_e89.tokens);
+
+                                #pragma omp critical
+                                {
+                                    if (size_e89 < best_size ||
+                                        (size_e89 == best_size && meta_e89.compressed_bits < best_meta.compressed_bits)) {
+                                        free(best_stream);
+                                        best_stream = stream_e89;
+                                        best_size = size_e89;
+                                        best_meta = meta_e89;
+                                    } else {
+                                        free(stream_e89);
+                                    }
+                                }
+                            }
+                        }
+                        free(e8e9_buf);
                     }
                 }
                 free(e8_buf);
             }
         }
 
-        /* B. Multi-core search over candidate strides (STRD_80B, COMPAT_82B, STRD_82B, UNIV_93B) */
+        /* B. Multi-core search over candidate strides (STRD_80B, COMPAT_82B, STRD_82B, UNIV_93B, HYBRID_108B) */
         if (format != ULTRA_FORMAT_X86E8_84B) {
             int candidate_strides[80];
             int num_strides = 0;
@@ -1344,16 +1480,26 @@ uint8_t *ultra_compress_buffer(
             static const int extra_strides[] = {72, 80, 96, 128, 160, 256, 320};
             for (size_t idx = 0; idx < sizeof(extra_strides) / sizeof(extra_strides[0]); idx++) {
                 if (extra_strides[idx] < input_size) {
+                    if (format == ULTRA_FORMAT_HYBRID_108B && extra_strides[idx] > 256) {
+                        continue;
+                    }
                     candidate_strides[num_strides++] = extra_strides[idx];
                 }
             }
 
-            int max_passes = (format == ULTRA_FORMAT_STRD_82B) ? ULTRA_MAX_FILTER_PASSES : 1;
+            int max_passes = (format == ULTRA_FORMAT_STRD_82B || format == ULTRA_FORMAT_HYBRID_108B)
+                           ? ULTRA_MAX_FILTER_PASSES : 1;
             int nested_parallel = omp_in_parallel();
+
+            int best_s1_stride = 0;
+            int best_s1_tail = 0;
+            size_t best_s1_size = best_size;
+            uint8_t *best_s1_buf = NULL;
 
             #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
             for (int si = 0; si < num_strides; si++) {
                 int stride = candidate_strides[si];
+                int req_final_off = (format == ULTRA_FORMAT_HYBRID_108B) ? 0 : stride;
                 int max_full_count = input_size - stride;
                 int full_count = max_full_count > 65535 ? 65535 : max_full_count;
                 if (full_count <= 0) {
@@ -1361,9 +1507,11 @@ uint8_t *ultra_compress_buffer(
                 }
 
                 int kadane_gain = 0;
-                int kadane_tail = find_optimal_stride_tail_count(working_input, input_size, stride, &kadane_gain);
+                int unbiased_tail = 0;
+                int kadane_tail = find_optimal_stride_tail_count(
+                    working_input, input_size, stride, &kadane_gain, &unbiased_tail
+                );
 
-                /* Fast O(N) compressibility pre-check including same-channel linear ramps (d_cur == d_str) */
                 int is_structural_stride = (stride == 1 || stride == 2 || stride == 3 || stride == 4 ||
                                             stride == 6 || stride == 8 || stride == 12 || stride == 16 ||
                                             stride == 24 || stride == 32 || stride == 48 || stride == 64 ||
@@ -1381,13 +1529,14 @@ uint8_t *ultra_compress_buffer(
                     int hit = (d_cur == 0 || d_cur == d_prv);
                     if (!hit && i >= 2 * stride) {
                         uint8_t d_str = (uint8_t)(working_input[i - stride] - working_input[i - 2 * stride]);
-                        hit = (d_cur == d_str);
+                        uint8_t dd = (uint8_t)(d_cur - d_str);
+                        hit = (dd == 0 || dd == 1 || dd == 255);
                     }
                     if (hit) {
                         eq_dif++;
                     }
                 }
-                if (kadane_gain < 16 && (!is_structural_stride || eq_dif * 4 < eq_raw * 3)) {
+                if (stride > 4 && kadane_gain < 16 && (!is_structural_stride || eq_dif * 4 < eq_raw * 3)) {
                     continue;
                 }
 
@@ -1396,7 +1545,6 @@ uint8_t *ultra_compress_buffer(
                 assert(cur_buf != NULL && nxt_buf != NULL);
                 memcpy(cur_buf, working_input, (size_t)input_size);
 
-                int active_counts[ULTRA_MAX_FILTER_PASSES] = {0};
                 int prev_pass_bits = COST_INFINITY;
 
                 for (int pass = 1; pass <= max_passes; pass++) {
@@ -1405,10 +1553,9 @@ uint8_t *ultra_compress_buffer(
                     }
                     apply_forward_stride_difference(cur_buf, nxt_buf, input_size, stride, full_count);
                     memcpy(cur_buf, nxt_buf, (size_t)input_size);
-                    active_counts[pass - 1] = full_count;
 
                     ParsePlan plan_p = {NULL, 0, 0};
-                    if (solve_exact_parse(cur_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride, &plan_p)) {
+                    if (solve_exact_parse(cur_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, req_final_off, &plan_p)) {
                         int pass_bits = plan_p.payload_bits;
                         UltraMetadata meta_p;
                         memset(&meta_p, 0, sizeof(meta_p));
@@ -1416,7 +1563,10 @@ uint8_t *ultra_compress_buffer(
                         meta_p.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
                         meta_p.filter_passes = pass;
                         meta_p.filter_stride = stride;
-                        memcpy(meta_p.filter_counts, active_counts, sizeof(active_counts));
+                        for (int p_idx = 0; p_idx < pass; p_idx++) {
+                            meta_p.filter_strides[p_idx] = stride;
+                            meta_p.filter_counts[p_idx] = full_count;
+                        }
                         meta_p.compressed_bits = pass_bits;
 
                         size_t size_p = 0;
@@ -1436,17 +1586,27 @@ uint8_t *ultra_compress_buffer(
                             } else {
                                 free(stream_p);
                             }
+                            if (pass == 1 && size_p < best_s1_size) {
+                                best_s1_size = size_p;
+                                best_s1_stride = stride;
+                                best_s1_tail = full_count;
+                                free(best_s1_buf);
+                                best_s1_buf = (uint8_t *)malloc((size_t)input_size);
+                                memcpy(best_s1_buf, cur_buf, (size_t)input_size);
+                            }
                         }
 
-                        if (pass_bits > base_payload_bits + 512 || pass_bits > prev_pass_bits + 64) {
+                        if (pass_bits > base_payload_bits + 2048 || pass_bits > prev_pass_bits + 512) {
                             break;
                         }
                         prev_pass_bits = pass_bits;
                     }
+                    /* Note: Do NOT break if solve_exact_parse returns 0 on an even pass (e.g. pass 2 on audio PCM),
+                     * because odd pass 3 can produce matches at offset=stride! */
                 }
 
                 /* Harmonic multi-pass counts (count_p = input_size - pass * stride) avoiding boundary artifacts */
-                if (max_passes > 1 && stride <= 8 && prev_pass_bits < base_payload_bits) {
+                if (max_passes > 1 && stride <= 8 && prev_pass_bits < base_payload_bits + 1024) {
                     memcpy(cur_buf, working_input, (size_t)input_size);
                     int harm_counts[ULTRA_MAX_FILTER_PASSES] = {0};
                     int prev_harm_bits = COST_INFINITY;
@@ -1460,7 +1620,7 @@ uint8_t *ultra_compress_buffer(
                         harm_counts[pass - 1] = hc;
                         if (pass >= 2) {
                             ParsePlan plan_hm = {NULL, 0, 0};
-                            if (solve_exact_parse(cur_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride, &plan_hm)) {
+                            if (solve_exact_parse(cur_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, req_final_off, &plan_hm)) {
                                 int hm_bits = plan_hm.payload_bits;
                                 UltraMetadata meta_hm;
                                 memset(&meta_hm, 0, sizeof(meta_hm));
@@ -1468,7 +1628,13 @@ uint8_t *ultra_compress_buffer(
                                 meta_hm.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
                                 meta_hm.filter_passes = pass;
                                 meta_hm.filter_stride = stride;
-                                memcpy(meta_hm.filter_counts, harm_counts, sizeof(harm_counts));
+                                for (int p_idx = 0; p_idx < pass; p_idx++) {
+                                    meta_hm.filter_strides[p_idx] = stride;
+                                    meta_hm.filter_counts[p_idx] = harm_counts[pass - 1 - p_idx];
+                                }
+                                if (format != ULTRA_FORMAT_HYBRID_108B) {
+                                    memcpy(meta_hm.filter_counts, harm_counts, sizeof(harm_counts));
+                                }
                                 meta_hm.compressed_bits = hm_bits;
 
                                 size_t size_hm = 0;
@@ -1489,7 +1655,7 @@ uint8_t *ultra_compress_buffer(
                                         free(stream_hm);
                                     }
                                 }
-                                if (hm_bits > prev_harm_bits + 64) {
+                                if (hm_bits > prev_harm_bits + 512) {
                                     break;
                                 }
                                 prev_harm_bits = hm_bits;
@@ -1498,30 +1664,59 @@ uint8_t *ultra_compress_buffer(
                     }
                 }
 
-                /* Evaluate piecewise half-tail and Kadane-optimal tail filtering for hybrid binaries */
-                int cand_piecewise[2];
+                /* Evaluate piecewise half-tail, Kadane-optimal tail, unbiased Kadane tail, and stride-aligned tails */
+                int cand_piecewise[6];
                 int num_piecewise = 0;
                 int half_count = input_size / 2;
-                if (!nested_parallel && input_size >= 128 && half_count > stride && half_count < full_count &&
-                    (input_size <= 8192 || stride <= 2 || kadane_gain >= 16)) {
+                if (!nested_parallel && input_size >= 128 && half_count > stride && half_count < full_count) {
                     cand_piecewise[num_piecewise++] = half_count;
                 }
-                if (!nested_parallel && kadane_gain >= 16 && kadane_tail > stride && kadane_tail < full_count &&
-                    (num_piecewise == 0 || abs(kadane_tail - cand_piecewise[0]) > 16)) {
-                    cand_piecewise[num_piecewise++] = kadane_tail;
+                int k_cands[4];
+                int nk = 0;
+                if (kadane_tail > stride && kadane_tail < full_count) {
+                    k_cands[nk++] = kadane_tail;
+                    if (stride > 1) {
+                        int aligned = ((kadane_tail + stride / 2) / stride) * stride;
+                        if (aligned > stride && aligned < full_count) {
+                            k_cands[nk++] = aligned;
+                        }
+                    }
+                }
+                if (unbiased_tail > stride && unbiased_tail < full_count) {
+                    k_cands[nk++] = unbiased_tail;
+                    if (stride > 1) {
+                        int aligned_u = ((unbiased_tail + stride / 2) / stride) * stride;
+                        if (aligned_u > stride && aligned_u < full_count) {
+                            k_cands[nk++] = aligned_u;
+                        }
+                    }
+                }
+                for (int ki = 0; ki < nk; ki++) {
+                    int tc = k_cands[ki];
+                    int dup = 0;
+                    for (int m = 0; m < num_piecewise; m++) {
+                        if (cand_piecewise[m] == tc) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (!dup && num_piecewise < 6) {
+                        cand_piecewise[num_piecewise++] = tc;
+                    }
                 }
 
                 for (int pi = 0; pi < num_piecewise; pi++) {
                     int tail_c = cand_piecewise[pi];
                     apply_forward_stride_difference(working_input, nxt_buf, input_size, stride, tail_c);
                     ParsePlan plan_h = {NULL, 0, 0};
-                    if (solve_exact_parse(nxt_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride, &plan_h)) {
+                    if (solve_exact_parse(nxt_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, req_final_off, &plan_h)) {
                         UltraMetadata meta_h;
                         memset(&meta_h, 0, sizeof(meta_h));
                         meta_h.format = format;
                         meta_h.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
                         meta_h.filter_passes = 1;
                         meta_h.filter_stride = stride;
+                        meta_h.filter_strides[0] = stride;
                         meta_h.filter_counts[0] = tail_c;
                         meta_h.compressed_bits = plan_h.payload_bits;
 
@@ -1542,6 +1737,59 @@ uint8_t *ultra_compress_buffer(
                             } else {
                                 free(stream_h);
                             }
+                            if (size_h < best_s1_size) {
+                                best_s1_size = size_h;
+                                best_s1_stride = stride;
+                                best_s1_tail = tail_c;
+                                free(best_s1_buf);
+                                best_s1_buf = (uint8_t *)malloc((size_t)input_size);
+                                memcpy(best_s1_buf, nxt_buf, (size_t)input_size);
+                            }
+                        }
+                    }
+
+                    /* Multi-pass piecewise tail integration for STRD_82B and HYBRID_108B */
+                    if (max_passes > 1 && stride <= 16) {
+                        memcpy(cur_buf, nxt_buf, (size_t)input_size);
+                        for (int pass = 2; pass <= 3; pass++) {
+                            if (tail_c <= pass * stride) {
+                                break;
+                            }
+                            apply_forward_stride_difference(cur_buf, nxt_buf, input_size, stride, tail_c);
+                            memcpy(cur_buf, nxt_buf, (size_t)input_size);
+                            ParsePlan plan_mp = {NULL, 0, 0};
+                            if (solve_exact_parse(cur_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, req_final_off, &plan_mp)) {
+                                UltraMetadata meta_mp;
+                                memset(&meta_mp, 0, sizeof(meta_mp));
+                                meta_mp.format = format;
+                                meta_mp.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                                meta_mp.filter_passes = pass;
+                                meta_mp.filter_stride = stride;
+                                for (int p_idx = 0; p_idx < pass; p_idx++) {
+                                    meta_mp.filter_strides[p_idx] = stride;
+                                    meta_mp.filter_counts[p_idx] = tail_c;
+                                }
+                                meta_mp.compressed_bits = plan_mp.payload_bits;
+
+                                size_t size_mp = 0;
+                                uint8_t *stream_mp = encode_plan_to_stream(
+                                    cur_buf, &plan_mp, format, ZX0_DEFAULT_LSB_BITS, &meta_mp, &size_mp
+                                );
+                                free(plan_mp.tokens);
+
+                                #pragma omp critical
+                                {
+                                    if (size_mp < best_size ||
+                                        (size_mp == best_size && meta_mp.compressed_bits < best_meta.compressed_bits)) {
+                                        free(best_stream);
+                                        best_stream = stream_mp;
+                                        best_size = size_mp;
+                                        best_meta = meta_mp;
+                                    } else {
+                                        free(stream_mp);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1549,7 +1797,164 @@ uint8_t *ultra_compress_buffer(
                 free(cur_buf);
                 free(nxt_buf);
             }
+
+            /* C. HYBRID_108B Chained Multi-Stage Search:
+             *    1) True 2D Spatial Prediction (stride S1 followed by distinct stride S2)
+             *    2) Chained x86 E8 + E9 + Multi-Segment 2D Stride-Delta for hybrid code+data ROMs
+             */
+            if (format == ULTRA_FORMAT_HYBRID_108B) {
+                if (best_s1_buf != NULL && best_s1_stride > 0) {
+                    static const int s2_list[] = {1, 2, 3, 4, 8, 12, 16, 24, 32, 48, 64, 128};
+                    uint8_t *buf_2d = (uint8_t *)malloc((size_t)input_size);
+                    assert(buf_2d != NULL);
+                    for (size_t idx = 0; idx < sizeof(s2_list) / sizeof(s2_list[0]); idx++) {
+                        int s2 = s2_list[idx];
+                        if (s2 == best_s1_stride || s2 >= input_size) {
+                            continue;
+                        }
+                        int kg2 = 0, ub2 = 0;
+                        int kt2 = find_optimal_stride_tail_count(best_s1_buf, input_size, s2, &kg2, &ub2);
+                        int tails_2d[3];
+                        int nt2 = 0;
+                        int fc2 = (input_size - s2) > 65535 ? 65535 : (input_size - s2);
+                        tails_2d[nt2++] = fc2;
+                        if (best_s1_tail > s2 && best_s1_tail < fc2) {
+                            tails_2d[nt2++] = best_s1_tail;
+                        }
+                        if (kt2 > s2 && kt2 < fc2 && kt2 != best_s1_tail) {
+                            tails_2d[nt2++] = kt2;
+                        }
+                        for (int ti = 0; ti < nt2; ti++) {
+                            int t2 = tails_2d[ti];
+                            apply_forward_stride_difference(best_s1_buf, buf_2d, input_size, s2, t2);
+                            ParsePlan plan_2d = {NULL, 0, 0};
+                            if (solve_exact_parse(buf_2d, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan_2d)) {
+                                UltraMetadata meta_2d;
+                                memset(&meta_2d, 0, sizeof(meta_2d));
+                                meta_2d.format = format;
+                                meta_2d.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                                meta_2d.filter_passes = 2;
+                                meta_2d.filter_stride = best_s1_stride;
+                                /* Decoder runs in reverse order of encoder forward transforms */
+                                meta_2d.filter_strides[0] = s2;
+                                meta_2d.filter_counts[0] = t2;
+                                meta_2d.filter_strides[1] = best_s1_stride;
+                                meta_2d.filter_counts[1] = best_s1_tail;
+                                meta_2d.compressed_bits = plan_2d.payload_bits;
+
+                                size_t size_2d = 0;
+                                uint8_t *stream_2d = encode_plan_to_stream(
+                                    buf_2d, &plan_2d, format, ZX0_DEFAULT_LSB_BITS, &meta_2d, &size_2d
+                                );
+                                free(plan_2d.tokens);
+
+                                if (size_2d < best_size ||
+                                    (size_2d == best_size && meta_2d.compressed_bits < best_meta.compressed_bits)) {
+                                    free(best_stream);
+                                    best_stream = stream_2d;
+                                    best_size = size_2d;
+                                    best_meta = meta_2d;
+                                } else {
+                                    free(stream_2d);
+                                }
+                            }
+                        }
+                    }
+                    free(buf_2d);
+                }
+
+                if (best_e8_buf != NULL && best_e8_tail_chosen >= 3) {
+                    static const int hyb_strides[] = {1, 2, 3, 4, 8, 12, 16, 24, 32, 64};
+                    uint8_t *st_buf = (uint8_t *)malloc((size_t)input_size);
+                    uint8_t *e8_on_st = (uint8_t *)malloc((size_t)input_size);
+                    uint8_t *e9_on_st = (uint8_t *)malloc((size_t)input_size);
+                    assert(st_buf != NULL && e8_on_st != NULL && e9_on_st != NULL);
+
+                    for (size_t idx = 0; idx < sizeof(hyb_strides) / sizeof(hyb_strides[0]); idx++) {
+                        int st = hyb_strides[idx];
+                        if (st >= input_size) {
+                            continue;
+                        }
+                        int kg = 0, ub = 0;
+                        int kt = find_optimal_stride_tail_count(working_input, input_size, st, &kg, &ub);
+                        int c_tails[4];
+                        int n_ct = 0;
+                        if (kt > st && kt < input_size - st) c_tails[n_ct++] = kt;
+                        if (ub > st && ub < input_size - st && ub != kt) c_tails[n_ct++] = ub;
+                        if (input_size / 2 > st) c_tails[n_ct++] = input_size / 2;
+                        if (input_size >= 3072 && 2048 > st) c_tails[n_ct++] = 2048;
+
+                        for (int ti = 0; ti < n_ct; ti++) {
+                            int t_st = c_tails[ti];
+                            apply_forward_stride_difference(working_input, st_buf, input_size, st, t_st);
+                            for (int p = 1; p <= 2; p++) {
+                                if (p == 2) {
+                                    if (st > 4 || t_st <= 2 * st) break;
+                                    uint8_t *tmp = (uint8_t *)malloc((size_t)input_size);
+                                    apply_forward_stride_difference(st_buf, tmp, input_size, st, t_st);
+                                    memcpy(st_buf, tmp, (size_t)input_size);
+                                    free(tmp);
+                                }
+                                /* Decoder runs E8 -> E9 -> Stride, so encoder applies Stride -> E9 -> E8 */
+                                int e9_tail = 3;
+                                if (st_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
+                                    st_buf[input_size - 1] != X86_OPCODE_JMP_REL16 &&
+                                    st_buf[input_size - 3] != X86_OPCODE_JMP_REL16) {
+                                    memcpy(e9_on_st, st_buf, (size_t)input_size);
+                                    if (e9_on_st[input_size - 2] != X86_OPCODE_CALL_REL16 &&
+                                        e9_on_st[input_size - 1] != X86_OPCODE_CALL_REL16) {
+                                        int h8 = apply_forward_x86_opcode_filter(
+                                            e9_on_st, e8_on_st, input_size, best_e8_tail_chosen, X86_OPCODE_CALL_REL16
+                                        );
+                                        if (h8 >= 2) {
+                                            ParsePlan plan_hyb = {NULL, 0, 0};
+                                            if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan_hyb)) {
+                                                UltraMetadata meta_hyb;
+                                                memset(&meta_hyb, 0, sizeof(meta_hyb));
+                                                meta_hyb.format = format;
+                                                meta_hyb.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                                                meta_hyb.filter_passes = 2 + p;
+                                                meta_hyb.filter_stride = 0; /* Signals V=281 (E8+E9 entry) */
+                                                meta_hyb.filter_strides[0] = 0;
+                                                meta_hyb.filter_counts[0] = best_e8_tail_chosen;
+                                                meta_hyb.filter_strides[1] = 0;
+                                                meta_hyb.filter_counts[1] = e9_tail;
+                                                for (int pk = 0; pk < p; pk++) {
+                                                    meta_hyb.filter_strides[2 + pk] = st;
+                                                    meta_hyb.filter_counts[2 + pk] = t_st;
+                                                }
+                                                meta_hyb.compressed_bits = plan_hyb.payload_bits;
+
+                                                size_t size_hyb = 0;
+                                                uint8_t *stream_hyb = encode_plan_to_stream(
+                                                    e8_on_st, &plan_hyb, format, ZX0_DEFAULT_LSB_BITS, &meta_hyb, &size_hyb
+                                                );
+                                                free(plan_hyb.tokens);
+
+                                                if (size_hyb < best_size ||
+                                                    (size_hyb == best_size && meta_hyb.compressed_bits < best_meta.compressed_bits)) {
+                                                    free(best_stream);
+                                                    best_stream = stream_hyb;
+                                                    best_size = size_hyb;
+                                                    best_meta = meta_hyb;
+                                                } else {
+                                                    free(stream_hyb);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    free(st_buf);
+                    free(e8_on_st);
+                    free(e9_on_st);
+                }
+            }
+            free(best_s1_buf);
         }
+        free(best_e8_buf);
     }
 
     assert(best_stream != NULL);
