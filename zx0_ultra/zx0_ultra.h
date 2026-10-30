@@ -20,6 +20,8 @@
 #define ZX0_DEFAULT_LSB_BITS        7
 #define ZX0_MAX_OFFSET              32640
 #define ZX0_EOF_MSB_VALUE           256
+#define ZX0_EOF_ALT_VALUE           257
+#define ZX0_EOF_E8_VALUE            281
 #define ZX0_LITERAL_BITS_PER_BYTE   8
 
 /* Monotonic literal-frontier capacity: Elias gamma concavity guarantees <= 12 undominated split points */
@@ -33,7 +35,8 @@ typedef enum {
     ULTRA_FORMAT_STRD_80B   = 2, /* 80-byte 1st-order arbitrary 16-bit Stride-Delta post-filter */
     ULTRA_FORMAT_STRD_82B   = 3, /* 82-byte Multi-pass (Order-1..5) Stride-Delta post-filter */
     ULTRA_FORMAT_COMPAT_82B = 4, /* 82-byte Zero-Overhead ZX0-compatible + Order-1 Stride-Delta */
-    ULTRA_FORMAT_X86E8_84B  = 5  /* 84-byte Zero-Overhead ZX0-compatible + x86 E8 Call-Target filter */
+    ULTRA_FORMAT_X86E8_84B  = 5, /* 84-byte Zero-Overhead ZX0-compatible + x86 E8 Call-Target filter */
+    ULTRA_FORMAT_UNIV_93B   = 6  /* 93-byte Universal Zero-Overhead ZX0 + Stride-Delta + x86 E8 filter */
 } UltraFormat;
 
 typedef struct {

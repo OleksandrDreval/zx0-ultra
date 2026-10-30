@@ -1,8 +1,26 @@
-# Subdirectory Makefile for zx0_ultra (outputs into ../bin)
+# Subdirectory Cross-Platform (Linux / POSIX / Windows) Makefile for zx0_ultra (outputs into ../bin)
 
-CC       ?= gcc
-CFLAGS   ?= -O3 -march=native -Wall -Wextra -Werror -std=c11
-OMPFLAGS ?= -fopenmp
+CC       ?= $(shell command -v gcc >/dev/null 2>&1 && echo gcc || (command -v clang >/dev/null 2>&1 && echo clang || echo cc))
+UNAME_S  := $(shell uname -s 2>/dev/null || echo Unknown)
+
+CFLAGS   ?= -O3 -Wall -Wextra -Werror -std=c11
+ifeq ($(UNAME_S),Linux)
+    CFLAGS += -pthread
+    ARCH_NATIVE_OK := $(shell $(CC) -march=native -E - </dev/null >/dev/null 2>&1 && echo 1 || echo 0)
+    ifeq ($(ARCH_NATIVE_OK),1)
+        CFLAGS += -march=native
+    endif
+else
+    CFLAGS += -march=native
+endif
+
+OMP_OK   := $(shell $(CC) -fopenmp -E - </dev/null >/dev/null 2>&1 && echo 1 || echo 0)
+ifeq ($(OMP_OK),1)
+    OMPFLAGS ?= -fopenmp
+else
+    OMPFLAGS ?=
+endif
+
 BIN_DIR  := ../bin
 
 ifeq ($(OS),Windows_NT)
@@ -18,13 +36,22 @@ endif
 TARGET := $(BIN_DIR)/zx0_ultra$(EXE)
 SRCS   := zx0_ultra_cli.c ultra_engine.c sprite_solver.c
 
-.PHONY: all clean
+.PHONY: all linux test clean
 
 all: $(TARGET)
 
+linux: $(TARGET)
+
 $(TARGET): $(SRCS) zx0_ultra.h
 	@$(MKDIR_BIN)
-	$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $(SRCS)
+	@if command -v $(CC) >/dev/null 2>&1; then \
+		$(CC) $(CFLAGS) $(OMPFLAGS) -o $@ $(SRCS); \
+	else \
+		cp zx0_ultra_linux_cli.js $@ && chmod +x $@; \
+	fi
+
+test: $(TARGET)
+	python3 test_ultra_suite.py
 
 clean:
 	$(CLEAN_CMD)

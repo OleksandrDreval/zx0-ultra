@@ -8,7 +8,17 @@
 
 #include "zx0_ultra.h"
 
+#ifdef _OPENMP
 #include <omp.h>
+#else
+#include <time.h>
+static inline double omp_get_wtime(void) {
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+}
+static inline int omp_get_max_threads(void) {
+    return 1;
+}
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +80,7 @@ static const char *format_label(UltraFormat fmt) {
         case ULTRA_FORMAT_STRD_82B:   return "STRD-82B (Order-M Stride)";
         case ULTRA_FORMAT_COMPAT_82B: return "COMPAT-82B (0B-Ovh + Stride)";
         case ULTRA_FORMAT_X86E8_84B:  return "X86E8-84B (0B-Ovh + E8 Call)";
+        case ULTRA_FORMAT_UNIV_93B:   return "UNIV-93B (0B-Ovh + Stride + E8)";
         default:                      return "Unknown";
     }
 }
@@ -87,7 +98,8 @@ static void print_usage(const char *prog) {
         "  --strd80    1st-order arbitrary 16-bit Stride-Delta post-filter (80-byte unzx0_strd_80b.asm)\n"
         "  --compat82  Zero-overhead ZX0-compatible + Order-1 Stride-Delta (82-byte unzx0_compat_82b.asm)\n"
         "  --strd82    Multi-pass Order-1..5 Stride-Delta post-filter (82-byte unzx0_strd_82b.asm)\n"
-        "  --x86e8     Zero-overhead ZX0-compatible + x86 E8 Call-Target filter (84-byte unzx0_x86e8_84b.asm)\n",
+        "  --x86e8     Zero-overhead ZX0-compatible + x86 E8 Call-Target filter (84-byte unzx0_x86e8_84b.asm)\n"
+        "  --univ93    Universal Zero-overhead ZX0 + Stride-Delta + x86 E8 filter (93-byte unzx0_univ_93b.asm)\n",
         prog, prog, prog
     );
 }
@@ -149,7 +161,9 @@ static int handle_pack_command(
            sum_raw, sol.total_uncompressed_size, sol.compressed_size, sol.metadata.compressed_bits);
     if (format == ULTRA_FORMAT_ADPK_77B) {
         printf("  Selected offset_lsb_bits (k): %d\n", sol.metadata.offset_lsb_bits);
-    } else if (format == ULTRA_FORMAT_X86E8_84B && sol.metadata.filter_passes > 0) {
+    } else if ((format == ULTRA_FORMAT_X86E8_84B ||
+                (format == ULTRA_FORMAT_UNIV_93B && sol.metadata.filter_stride == 0)) &&
+               sol.metadata.filter_passes > 0) {
         printf("  Selected x86 E8 Call-Target tail: %d B\n", sol.metadata.filter_counts[0]);
     } else if (sol.metadata.filter_passes > 0) {
         printf("  Selected Stride-Delta: passes=%d, stride=%d, tail=%d B\n",
@@ -207,6 +221,8 @@ int main(int argc, char **argv) {
             format = ULTRA_FORMAT_STRD_82B;
         } else if (strcmp(argv[i], "--x86e8") == 0) {
             format = ULTRA_FORMAT_X86E8_84B;
+        } else if (strcmp(argv[i], "--univ93") == 0) {
+            format = ULTRA_FORMAT_UNIV_93B;
         } else if (strcmp(argv[i], "--decompress") == 0 || strcmp(argv[i], "-d") == 0) {
             decompress_mode = 1;
         } else if (strcmp(argv[i], "--pack") == 0) {
@@ -285,7 +301,9 @@ int main(int argc, char **argv) {
            meta.compressed_bits, elapsed);
     if (format == ULTRA_FORMAT_ADPK_77B) {
         printf(" [k=%d]", meta.offset_lsb_bits);
-    } else if (format == ULTRA_FORMAT_X86E8_84B && meta.filter_passes > 0) {
+    } else if ((format == ULTRA_FORMAT_X86E8_84B ||
+                (format == ULTRA_FORMAT_UNIV_93B && meta.filter_stride == 0)) &&
+               meta.filter_passes > 0) {
         printf(" [e8_tail=%d]", meta.filter_counts[0]);
     } else if (meta.filter_passes > 0) {
         printf(" [stride=%d, passes=%d, tail=%d]", meta.filter_stride, meta.filter_passes, meta.filter_counts[0]);

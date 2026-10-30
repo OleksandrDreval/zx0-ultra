@@ -9,7 +9,11 @@
 #include "zx0_ultra.h"
 
 #include <assert.h>
+#ifdef _OPENMP
 #include <omp.h>
+#else
+static inline int omp_in_parallel(void) { return 0; }
+#endif
 #include <stdlib.h>
 #include <string.h>
 
