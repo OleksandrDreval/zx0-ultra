@@ -82,6 +82,7 @@ static const char *format_label(UltraFormat fmt) {
         case ULTRA_FORMAT_X86E8_84B:   return "X86E8-84B (0B-Ovh + E8 Call)";
         case ULTRA_FORMAT_UNIV_93B:    return "UNIV-93B (0B-Ovh + Stride + E8)";
         case ULTRA_FORMAT_HYBRID_108B: return "HYBRID-108B (0B-Ovh + E8/E9 + 2D Stride)";
+        case ULTRA_FORMAT_PRO_111B:    return "PRO-111B (0B-Ovh + E8/E9 + 16b/8b 2D Stride)";
         case ULTRA_FORMAT_ULTRA_128B:  return "ULTRA-128B (VarLit + E8/E9 + 16b/8b 2D Stride)";
         default:                       return "Unknown";
     }
@@ -103,6 +104,7 @@ static void print_usage(const char *prog) {
         "  --x86e8      Zero-overhead ZX0-compatible + x86 E8 Call-Target filter (84-byte unzx0_x86e8_84b.asm)\n"
         "  --univ93     Universal Zero-overhead ZX0 + Stride-Delta + x86 E8 filter (93-byte unzx0_univ_93b.asm)\n"
         "  --hybrid108  Multi-Stage Hybrid 2D 0B-Ovh ZX0 + E8/E9 + Free-BX Stride (108-byte unzx0_hybrid_108b.asm)\n"
+        "  --pro111     Zero-Overhead ZX0 + E8/E9 + 16-Bit/8-Bit 2D Stride (111-byte unzx0_pro_111b.asm)\n"
         "  --ultra128   Flagship Variable-Bit Literals + E8/E9 + 16-Bit/8-Bit 2D Stride (128-byte unzx0_ultra_128b.asm)\n",
         prog, prog, prog
     );
@@ -229,6 +231,8 @@ int main(int argc, char **argv) {
             format = ULTRA_FORMAT_UNIV_93B;
         } else if (strcmp(argv[i], "--hybrid108") == 0 || strcmp(argv[i], "--hybrid110") == 0) {
             format = ULTRA_FORMAT_HYBRID_108B;
+        } else if (strcmp(argv[i], "--pro111") == 0) {
+            format = ULTRA_FORMAT_PRO_111B;
         } else if (strcmp(argv[i], "--ultra128") == 0) {
             format = ULTRA_FORMAT_ULTRA_128B;
         } else if (strcmp(argv[i], "--decompress") == 0 || strcmp(argv[i], "-d") == 0) {
@@ -313,9 +317,9 @@ int main(int argc, char **argv) {
     if (format == ULTRA_FORMAT_ADPK_77B) {
         printf(" [k=%d]", meta.offset_lsb_bits);
     } else if ((format == ULTRA_FORMAT_X86E8_84B ||
-                ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_stride == 0)) &&
+                ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_stride == 0)) &&
                meta.filter_passes > 0) {
-        if ((format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_passes > 2) {
+        if ((format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_passes > 2) {
             printf(" [e8_tail=%d, stride=%d, passes=%d, tail=%d]",
                    meta.filter_counts[0], meta.filter_strides[2], meta.filter_passes - 2, meta.filter_counts[2]);
         } else {

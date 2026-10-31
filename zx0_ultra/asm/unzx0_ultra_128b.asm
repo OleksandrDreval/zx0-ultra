@@ -8,17 +8,18 @@
 ;                bit 0 ('1'), and DH with literal width sentinel 1 << (8 - lit_bits) (0x01=8b,
 ;                0x02=7b ASCII, 0x04=6b VGA DAC). Unpacks variable-bit literals via stosb.
 ;              - Algebraic Multi-Mode EOF Dispatch & Fall-Through E8/E9 Post-Filter:
-;                - Mode 0 (V=256): Standard 0-byte trailer EOF (inc ch -> 0x00, jz .done),
-;                  achieving 100% backward compatibility on unfiltered streams.
+;                - Mode 0 (V=256): Standard 0-byte trailer EOF (inc ch -> 0x00, jz .done).
 ;                - Mode 1 (V=257): Enters .mp_loop directly in .floop (inc ax -> 0x0000, SF=0).
 ;                - Mode 2 (V=1049): Runs 1 pass of .e8_loop (AL=0xE8, CALL rel16), then transitions
 ;                  to .floop.
 ;                - Mode 3 (V=537): Runs Pass 1 (AL=0xE8, CALL rel16) and Pass 2 (AL=0xE9,
 ;                  JMP rel16), then transitions automatically to .floop on Pass 3+.
-;              - Unified 16-Bit Word / 8-Bit Byte 2D Stride Integrator: inside .floop, 'inc dx /
-;                jns .badd' dynamically selects between 16-bit Word-Stride-Delta (add [di], ax /
-;                inc di / dec cx / cmp ax, 0x0500 / inc di, DX=0x8000) and 8-bit Byte-Stride-Delta
-;                (add [di], al / inc di, DX=0x0000) with full 16-bit stride support (1..32768).
+;              - Compact 4-Byte-Per-Pass 16-Bit Word / 8-Bit Byte 2D Stride Integrator:
+;                Reads count_u16 + packed mode_stride_u16 (AL = 256 - stride, AH = 0x80 for
+;                16-bit Word-mode or 0x00 for 8-bit Byte-mode). Inside .floop, 'add [di], al'
+;                computes the low-byte sum and sets CF; 'inc di / inc dx / jns .fnext' preserves
+;                CF and branches on SF of DX; in 16-bit Word-mode, 'adc [di], ah / inc di / dec cx'
+;                propagates the carry into the high byte (saving 2 bytes per pass in the stream).
 ;
 ; Credits & Copyright:
 ;   - Algorithm: ZX0 by Einar Saukas (c) 2021 (BSD 3-Clause)
@@ -118,21 +119,20 @@ dzx0:
     inc ax
     js .e8_loop
     lodsw
-    xchg ax, dx
-    lodsw
+    mov dh, ah
+    cbw
     xchg ax, bx
 
 .floop:
     mov ax, [bx+di]
-    inc dx
-    jns .badd
-    add [di], ax
-    inc di
-    dec cx
-    db 0x3d
-
-.badd:
     add [di], al
     inc di
+    inc dx
+    jns .fnext
+    adc [di], ah
+    inc di
+    dec cx
+
+.fnext:
     loop .floop
     jmp short .mp_loop

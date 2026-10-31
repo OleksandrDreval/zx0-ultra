@@ -175,13 +175,16 @@ def main() -> None:
         dec_hybrid_108 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_hybrid_108b.asm"), os.path.join(tmpdir, "dh108.bin")
         )
+        dec_pro_111 = assemble_flat_binary(
+            os.path.join(ASM_DIR, "unzx0_pro_111b.asm"), os.path.join(tmpdir, "dp111.bin")
+        )
         dec_ultra_128 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_ultra_128b.asm"), os.path.join(tmpdir, "du128.bin")
         )
 
-        print("=" * 146)
+        print("=" * 155)
         print("ASSEMBLED x86-16 DECOMPRESSOR FOOTPRINTS (NASM FLAT BINARIES vs 70B BASELINE & 128B MAX BUDGET)")
-        print("=" * 146)
+        print("=" * 155)
         print(f"  ZX things/unzx0_x86.asm          : {len(dec_x86_main):3d} bytes ({len(dec_x86_main)-70:+d}B vs 70B, 100% ZX0 v2 compatible)")
         print(f"  zx0_ultra/asm/unzx0_67b.asm      : {len(dec_67b):3d} bytes ({len(dec_67b)-70:+d}B vs 70B, 100% ZX0 v2 compatible)")
         print(f"  zx0_ultra/asm/unzx0_adpk_77b     : {len(dec_78b):3d} bytes ({len(dec_78b)-70:+d}B vs 70B, Adaptive-k 1..12 offset LSB)")
@@ -191,6 +194,7 @@ def main() -> None:
         print(f"  zx0_ultra/asm/unzx0_x86e8_84b    : {len(dec_x86e8_84):3d} bytes ({len(dec_x86e8_84)-70:+d}B vs 70B, 0B-ovh ZX0 compat + x86 E8 Call)")
         print(f"  zx0_ultra/asm/unzx0_univ_93b     : {len(dec_univ_93):3d} bytes ({len(dec_univ_93)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride + E8)")
         print(f"  zx0_ultra/asm/unzx0_hybrid_108b  : {len(dec_hybrid_108):3d} bytes ({len(dec_hybrid_108)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_pro_111b     : {len(dec_pro_111):3d} bytes ({len(dec_pro_111)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride)")
         print(f"  zx0_ultra/asm/unzx0_ultra_128b   : {len(dec_ultra_128):3d} bytes ({len(dec_ultra_128)-70:+d}B vs 70B, 4..8b Sentinel Lit + E8/E9 + 16b/8b 2D Stride)")
 
         assert len(dec_x86_main) == 67
@@ -202,6 +206,7 @@ def main() -> None:
         assert len(dec_x86e8_84) == 84
         assert len(dec_univ_93) == 93
         assert len(dec_hybrid_108) == 108
+        assert len(dec_pro_111) == 111
         assert len(dec_ultra_128) <= 128
 
         honest_corpus, edge_cases = load_honest_datasets_and_edge_cases()
@@ -209,15 +214,15 @@ def main() -> None:
         def evaluate_and_verify_table(title: str, items: list[tuple[str, bytes]]) -> int:
             import concurrent.futures
 
-            print("\n" + "=" * 146)
+            print("\n" + "=" * 155)
             print(title)
-            print("=" * 146)
+            print("=" * 155)
             header = (
                 f"{'Dataset':28s} | {'Raw':>6s} | {'OrigZX0':>7s} | {'UltZX0':>6s} | "
-                f"{'AdpK78':>6s} | {'Strd80':>6s} | {'Cmp82':>6s} | {'Strd82':>6s} | {'X86E84':>6s} | {'Univ93':>6s} | {'Hyb108':>6s} | {'Ult128':>6s} | {'SHA-256':12s}"
+                f"{'AdpK78':>6s} | {'Strd80':>6s} | {'Cmp82':>6s} | {'Strd82':>6s} | {'X86E84':>6s} | {'Univ93':>6s} | {'Hyb108':>6s} | {'Pro111':>6s} | {'Ult128':>6s} | {'SHA-256':12s}"
             )
             print(header)
-            print("-" * 146)
+            print("-" * 155)
 
             def process_one(item: tuple[str, bytes]) -> tuple[str, list[int], str, int]:
                 name, raw = item
@@ -228,7 +233,7 @@ def main() -> None:
                 expected_hash = sha256_hex(raw)
                 local_checks = 0
 
-                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, AND 108B-hybrid!)
+                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, 108B-hybrid, AND 111B-pro!)
                 orig_out = os.path.join(tmpdir, f"{name}.orig.zx0")
                 subprocess.run(
                     [ZX0_ORIG_EXE, "-f", in_p, orig_out],
@@ -242,9 +247,10 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_x86e8_84, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_orig, len(raw))) == expected_hash
-                local_checks += 5
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_orig, len(raw))) == expected_hash
+                local_checks += 6
 
-                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_108b)
+                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_108b, pro_111b)
                 u_zx0_p = os.path.join(tmpdir, f"{name}.uzx0")
                 subprocess.run([ZX0_ULTRA_EXE, "--zx0", in_p, u_zx0_p], check=True, stdout=subprocess.DEVNULL)
                 c_uzx0 = open(u_zx0_p, "rb").read()
@@ -254,7 +260,8 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_x86e8_84, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_uzx0, len(raw))) == expected_hash
-                local_checks += 6
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_uzx0, len(raw))) == expected_hash
+                local_checks += 7
 
                 # 3. ZX0-Ultra --adpk77 (verified on 78B unzx0_adpk_77b.asm, k=1..12)
                 u_k78_p = os.path.join(tmpdir, f"{name}.k78")
@@ -305,7 +312,14 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_h108, len(raw))) == expected_hash
                 local_checks += 1
 
-                # 10. ZX0-Ultra --ultra128 (verified on 128B unzx0_ultra_128b.asm)
+                # 10. ZX0-Ultra --pro111 (verified on 111B unzx0_pro_111b.asm)
+                u_p111_p = os.path.join(tmpdir, f"{name}.p111")
+                subprocess.run([ZX0_ULTRA_EXE, "--pro111", in_p, u_p111_p], check=True, stdout=subprocess.DEVNULL)
+                c_p111 = open(u_p111_p, "rb").read()
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_p111, len(raw))) == expected_hash
+                local_checks += 1
+
+                # 11. ZX0-Ultra --ultra128 (verified on 128B unzx0_ultra_128b.asm)
                 u_u128_p = os.path.join(tmpdir, f"{name}.u128")
                 subprocess.run([ZX0_ULTRA_EXE, "--ultra128", in_p, u_u128_p], check=True, stdout=subprocess.DEVNULL)
                 c_u128 = open(u_u128_p, "rb").read()
@@ -314,11 +328,11 @@ def main() -> None:
 
                 vals = [
                     len(raw), len(c_orig), len(c_uzx0), len(c_k78),
-                    len(c_s80), len(c_c82), len(c_s82), len(c_e84), len(c_u93), len(c_h108), len(c_u128),
+                    len(c_s80), len(c_c82), len(c_s82), len(c_e84), len(c_u93), len(c_h108), len(c_p111), len(c_u128),
                 ]
                 return name, vals, expected_hash, local_checks
 
-            totals = [0] * 11
+            totals = [0] * 12
             checks = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
                 results = list(ex.map(process_one, items))
@@ -329,13 +343,13 @@ def main() -> None:
                     totals[idx] += v
                 print(
                     f"{name:28s} | {vals[0]:6d} | {vals[1]:7d} | {vals[2]:6d} | "
-                    f"{vals[3]:6d} | {vals[4]:6d} | {vals[5]:6d} | {vals[6]:6d} | {vals[7]:6d} | {vals[8]:6d} | {vals[9]:6d} | {vals[10]:6d} | {expected_hash[:12]}"
+                    f"{vals[3]:6d} | {vals[4]:6d} | {vals[5]:6d} | {vals[6]:6d} | {vals[7]:6d} | {vals[8]:6d} | {vals[9]:6d} | {vals[10]:6d} | {vals[11]:6d} | {expected_hash[:12]}"
                 )
 
-            print("-" * 146)
+            print("-" * 155)
             print(
                 f"{f'TOTAL ({len(items)} files)':28s} | {totals[0]:6d} | {totals[1]:7d} | {totals[2]:6d} | "
-                f"{totals[3]:6d} | {totals[4]:6d} | {totals[5]:6d} | {totals[6]:6d} | {totals[7]:6d} | {totals[8]:6d} | {totals[9]:6d} | {totals[10]:6d} | PASS ({checks})"
+                f"{totals[3]:6d} | {totals[4]:6d} | {totals[5]:6d} | {totals[6]:6d} | {totals[7]:6d} | {totals[8]:6d} | {totals[9]:6d} | {totals[10]:6d} | {totals[11]:6d} | PASS ({checks})"
             )
             return checks
 
@@ -350,9 +364,9 @@ def main() -> None:
         )
 
         # Multi-Asset 7-Sprite Pack Solver (--pack)
-        print("\n" + "=" * 146)
+        print("\n" + "=" * 155)
         print("MULTI-CORE 7-SPRITE SUPERSTRING + WILDCARD BRIDGE SOLVER + UNICORN SLICE HASHING")
-        print("=" * 146)
+        print("=" * 155)
         sprite_entries = [
             ("sword_pommel", sprite_data.SWORD_POMMEL),
             ("sword_grip", sprite_data.SWORD_GRIP),
@@ -376,6 +390,7 @@ def main() -> None:
             ("--x86e8", dec_x86e8_84, "X86E8-84B (84B decoder)"),
             ("--univ93", dec_univ_93, "UNIV-93B (93B decoder)"),
             ("--hybrid108", dec_hybrid_108, "HYBRID-108B (108B decoder)"),
+            ("--pro111", dec_pro_111, "PRO-111B (111B decoder)"),
             ("--ultra128", dec_ultra_128, "ULTRA-128B (128B decoder)"),
         ]:
             out_comp = os.path.join(tmpdir, f"pack_{flag}.bin")
