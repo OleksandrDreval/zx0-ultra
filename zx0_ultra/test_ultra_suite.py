@@ -175,10 +175,13 @@ def main() -> None:
         dec_hybrid_108 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_hybrid_108b.asm"), os.path.join(tmpdir, "dh108.bin")
         )
+        dec_ultra_128 = assemble_flat_binary(
+            os.path.join(ASM_DIR, "unzx0_ultra_128b.asm"), os.path.join(tmpdir, "du128.bin")
+        )
 
-        print("=" * 136)
+        print("=" * 146)
         print("ASSEMBLED x86-16 DECOMPRESSOR FOOTPRINTS (NASM FLAT BINARIES vs 70B BASELINE & 128B MAX BUDGET)")
-        print("=" * 136)
+        print("=" * 146)
         print(f"  ZX things/unzx0_x86.asm          : {len(dec_x86_main):3d} bytes ({len(dec_x86_main)-70:+d}B vs 70B, 100% ZX0 v2 compatible)")
         print(f"  zx0_ultra/asm/unzx0_67b.asm      : {len(dec_67b):3d} bytes ({len(dec_67b)-70:+d}B vs 70B, 100% ZX0 v2 compatible)")
         print(f"  zx0_ultra/asm/unzx0_adpk_77b     : {len(dec_78b):3d} bytes ({len(dec_78b)-70:+d}B vs 70B, Adaptive-k 1..12 offset LSB)")
@@ -188,6 +191,7 @@ def main() -> None:
         print(f"  zx0_ultra/asm/unzx0_x86e8_84b    : {len(dec_x86e8_84):3d} bytes ({len(dec_x86e8_84)-70:+d}B vs 70B, 0B-ovh ZX0 compat + x86 E8 Call)")
         print(f"  zx0_ultra/asm/unzx0_univ_93b     : {len(dec_univ_93):3d} bytes ({len(dec_univ_93)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride + E8)")
         print(f"  zx0_ultra/asm/unzx0_hybrid_108b  : {len(dec_hybrid_108):3d} bytes ({len(dec_hybrid_108)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_ultra_128b   : {len(dec_ultra_128):3d} bytes ({len(dec_ultra_128)-70:+d}B vs 70B, 4..8b Sentinel Lit + E8/E9 + 16b/8b 2D Stride)")
 
         assert len(dec_x86_main) == 67
         assert len(dec_67b) == 67
@@ -198,21 +202,22 @@ def main() -> None:
         assert len(dec_x86e8_84) == 84
         assert len(dec_univ_93) == 93
         assert len(dec_hybrid_108) == 108
+        assert len(dec_ultra_128) <= 128
 
         honest_corpus, edge_cases = load_honest_datasets_and_edge_cases()
 
         def evaluate_and_verify_table(title: str, items: list[tuple[str, bytes]]) -> int:
             import concurrent.futures
 
-            print("\n" + "=" * 136)
+            print("\n" + "=" * 146)
             print(title)
-            print("=" * 136)
+            print("=" * 146)
             header = (
                 f"{'Dataset':28s} | {'Raw':>6s} | {'OrigZX0':>7s} | {'UltZX0':>6s} | "
-                f"{'AdpK78':>6s} | {'Strd80':>6s} | {'Cmp82':>6s} | {'Strd82':>6s} | {'X86E84':>6s} | {'Univ93':>6s} | {'Hyb108':>6s} | {'SHA-256':12s}"
+                f"{'AdpK78':>6s} | {'Strd80':>6s} | {'Cmp82':>6s} | {'Strd82':>6s} | {'X86E84':>6s} | {'Univ93':>6s} | {'Hyb108':>6s} | {'Ult128':>6s} | {'SHA-256':12s}"
             )
             print(header)
-            print("-" * 136)
+            print("-" * 146)
 
             def process_one(item: tuple[str, bytes]) -> tuple[str, list[int], str, int]:
                 name, raw = item
@@ -300,13 +305,20 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_h108, len(raw))) == expected_hash
                 local_checks += 1
 
+                # 10. ZX0-Ultra --ultra128 (verified on 128B unzx0_ultra_128b.asm)
+                u_u128_p = os.path.join(tmpdir, f"{name}.u128")
+                subprocess.run([ZX0_ULTRA_EXE, "--ultra128", in_p, u_u128_p], check=True, stdout=subprocess.DEVNULL)
+                c_u128 = open(u_u128_p, "rb").read()
+                assert sha256_hex(emulate_x86_decompressor(dec_ultra_128, c_u128, len(raw))) == expected_hash
+                local_checks += 1
+
                 vals = [
                     len(raw), len(c_orig), len(c_uzx0), len(c_k78),
-                    len(c_s80), len(c_c82), len(c_s82), len(c_e84), len(c_u93), len(c_h108),
+                    len(c_s80), len(c_c82), len(c_s82), len(c_e84), len(c_u93), len(c_h108), len(c_u128),
                 ]
                 return name, vals, expected_hash, local_checks
 
-            totals = [0] * 10
+            totals = [0] * 11
             checks = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
                 results = list(ex.map(process_one, items))
@@ -317,13 +329,13 @@ def main() -> None:
                     totals[idx] += v
                 print(
                     f"{name:28s} | {vals[0]:6d} | {vals[1]:7d} | {vals[2]:6d} | "
-                    f"{vals[3]:6d} | {vals[4]:6d} | {vals[5]:6d} | {vals[6]:6d} | {vals[7]:6d} | {vals[8]:6d} | {vals[9]:6d} | {expected_hash[:12]}"
+                    f"{vals[3]:6d} | {vals[4]:6d} | {vals[5]:6d} | {vals[6]:6d} | {vals[7]:6d} | {vals[8]:6d} | {vals[9]:6d} | {vals[10]:6d} | {expected_hash[:12]}"
                 )
 
-            print("-" * 136)
+            print("-" * 146)
             print(
                 f"{f'TOTAL ({len(items)} files)':28s} | {totals[0]:6d} | {totals[1]:7d} | {totals[2]:6d} | "
-                f"{totals[3]:6d} | {totals[4]:6d} | {totals[5]:6d} | {totals[6]:6d} | {totals[7]:6d} | {totals[8]:6d} | {totals[9]:6d} | PASS ({checks})"
+                f"{totals[3]:6d} | {totals[4]:6d} | {totals[5]:6d} | {totals[6]:6d} | {totals[7]:6d} | {totals[8]:6d} | {totals[9]:6d} | {totals[10]:6d} | PASS ({checks})"
             )
             return checks
 
@@ -338,9 +350,9 @@ def main() -> None:
         )
 
         # Multi-Asset 7-Sprite Pack Solver (--pack)
-        print("\n" + "=" * 136)
+        print("\n" + "=" * 146)
         print("MULTI-CORE 7-SPRITE SUPERSTRING + WILDCARD BRIDGE SOLVER + UNICORN SLICE HASHING")
-        print("=" * 136)
+        print("=" * 146)
         sprite_entries = [
             ("sword_pommel", sprite_data.SWORD_POMMEL),
             ("sword_grip", sprite_data.SWORD_GRIP),
@@ -364,6 +376,7 @@ def main() -> None:
             ("--x86e8", dec_x86e8_84, "X86E8-84B (84B decoder)"),
             ("--univ93", dec_univ_93, "UNIV-93B (93B decoder)"),
             ("--hybrid108", dec_hybrid_108, "HYBRID-108B (108B decoder)"),
+            ("--ultra128", dec_ultra_128, "ULTRA-128B (128B decoder)"),
         ]:
             out_comp = os.path.join(tmpdir, f"pack_{flag}.bin")
             out_raw = os.path.join(tmpdir, f"pack_{flag}.raw")

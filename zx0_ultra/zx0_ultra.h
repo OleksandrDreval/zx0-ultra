@@ -22,11 +22,13 @@
 #define ZX0_EOF_MSB_VALUE           256
 #define ZX0_EOF_ALT_VALUE           257
 #define ZX0_EOF_E8_VALUE            281
+#define ZX0_EOF_ULTRA_E8E9_VALUE    537
+#define ZX0_EOF_ULTRA_E8_VALUE      1049
 #define ZX0_LITERAL_BITS_PER_BYTE   8
 
 /* Monotonic literal-frontier capacity: Elias gamma concavity guarantees <= 12 undominated split points */
 #define ULTRA_MAX_FRONTIER_SIZE     24
-#define ULTRA_MAX_FILTER_PASSES     5
+#define ULTRA_MAX_FILTER_PASSES     6
 
 /* Supported bitstream formats corresponding to verified x86-16 assembly decompressors */
 typedef enum {
@@ -37,17 +39,20 @@ typedef enum {
     ULTRA_FORMAT_COMPAT_82B  = 4, /* 82-byte Zero-Overhead ZX0-compatible + Order-1 Stride-Delta */
     ULTRA_FORMAT_X86E8_84B   = 5, /* 84-byte Zero-Overhead ZX0-compatible + x86 E8 Call-Target filter */
     ULTRA_FORMAT_UNIV_93B    = 6, /* 93-byte Universal Zero-Overhead ZX0 + Stride-Delta + x86 E8 filter */
-    ULTRA_FORMAT_HYBRID_108B = 7  /* 108-byte Multi-Stage Hybrid 0B-Ovh ZX0 + E8/E9 + Free-BX 2D Stride */
+    ULTRA_FORMAT_HYBRID_108B = 7, /* 108-byte Multi-Stage Hybrid 0B-Ovh ZX0 + E8/E9 + Free-BX 2D Stride */
+    ULTRA_FORMAT_ULTRA_128B  = 8  /* 128-byte Flagship Variable-Bit Literals + E8/E9 + 16-Bit/8-Bit 2D Stride */
 } UltraFormat;
 
 typedef struct {
     UltraFormat format;
-    int offset_lsb_bits;                         /* 7 for standard ZX0; 1..12 for ULTRA_FORMAT_ADPK_77B */
-    int filter_passes;                           /* 0 = raw, 1..5 = active post-filter passes */
-    int filter_stride;                           /* Primary stride distance in bytes (0 for E8 call filter) */
-    int filter_strides[ULTRA_MAX_FILTER_PASSES]; /* Per-pass stride (0 = E8/E9, 1..256 = Stride-Delta) */
-    int filter_counts[ULTRA_MAX_FILTER_PASSES];  /* Filtered tail byte count per integration pass */
-    int compressed_bits;                         /* Exact payload bit count prior to byte alignment */
+    int offset_lsb_bits;                              /* 7 for standard ZX0; 1..12 for ULTRA_FORMAT_ADPK_77B */
+    int literal_bits;                                 /* 8 for standard; 4..8 for ULTRA_FORMAT_ULTRA_128B */
+    int filter_passes;                                /* 0 = raw, 1..5 = active post-filter passes */
+    int filter_stride;                                /* Primary stride distance in bytes (0 for E8 call filter) */
+    int filter_strides[ULTRA_MAX_FILTER_PASSES];      /* Per-pass stride (0 = E8/E9, 1..32768 = Stride-Delta) */
+    int filter_counts[ULTRA_MAX_FILTER_PASSES];       /* Filtered tail byte count per integration pass */
+    int filter_word_modes[ULTRA_MAX_FILTER_PASSES];   /* 0 = 8-bit Byte-ADD, 1 = 16-bit Word-ADD */
+    int compressed_bits;                              /* Exact payload bit count prior to byte alignment */
 } UltraMetadata;
 
 /*
