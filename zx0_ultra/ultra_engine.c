@@ -277,6 +277,90 @@ typedef struct {
     int payload_bits;
 } ParsePlan;
 
+typedef struct {
+    uint8_t bit_len[256];
+    uint8_t prefix_bit[256];
+    uint8_t payload_len[256];
+    uint8_t payload_val[256];
+    uint8_t min_len;
+} DhSpec;
+
+static void build_dh_spec(int dh, DhSpec *spec) {
+    memset(spec, 0, sizeof(*spec));
+    spec->min_len = 99;
+    const int p_order[2] = {1, 0};
+    for (int pi = 0; pi < 2; pi++) {
+        int p = p_order[pi];
+        int v = dh + p;
+        int k = 0;
+        while ((1 << (k + 1)) <= v) {
+            k++;
+        }
+        int m = 8 - k;
+        int base = (v - (1 << k)) << m;
+        for (int val = base; val < base + (1 << m) && val < 256; val++) {
+            uint8_t total_bits = (uint8_t)(1 + m);
+            if (spec->bit_len[val] == 0 || total_bits < spec->bit_len[val]) {
+                spec->bit_len[val] = total_bits;
+                spec->prefix_bit[val] = (uint8_t)p;
+                spec->payload_len[val] = (uint8_t)m;
+                spec->payload_val[val] = (uint8_t)(val - base);
+                if (total_bits < spec->min_len) {
+                    spec->min_len = total_bits;
+                }
+            }
+        }
+    }
+}
+
+static int find_best_dh_sentinel(
+    const uint8_t *input_data,
+    int input_size,
+    const uint8_t *wildcard_mask
+) {
+    int best_flat_dh = 2;
+    int best_flat_bits = input_size * 8;
+    int best_split_dh = -1;
+    int best_split_bits = input_size * 8;
+    DhSpec spec;
+
+    for (int dh = 1; dh <= 63; dh++) {
+        build_dh_spec(dh, &spec);
+        int sum = 0;
+        int ok = 1;
+        for (int i = 0; i < input_size; i++) {
+            if (wildcard_mask != NULL && wildcard_mask[i] != 0) {
+                sum += spec.min_len;
+                continue;
+            }
+            uint8_t l = spec.bit_len[input_data[i]];
+            if (l == 0) {
+                ok = 0;
+                break;
+            }
+            sum += l;
+        }
+        if (!ok) {
+            continue;
+        }
+        if ((dh & (dh + 1)) == 0) {
+            if (sum < best_split_bits) {
+                best_split_bits = sum;
+                best_split_dh = dh;
+            }
+        } else {
+            if (sum < best_flat_bits) {
+                best_flat_bits = sum;
+                best_flat_dh = dh;
+            }
+        }
+    }
+    if (best_split_dh > 0 && best_split_bits < best_flat_bits) {
+        return best_split_dh;
+    }
+    return best_flat_dh;
+}
+
 static inline int detect_buffer_literal_bits(
     const uint8_t *input_data,
     int input_size,
@@ -304,7 +388,8 @@ static inline int detect_buffer_literal_bits(
  * and Topological Mark-and-Compact GC.
  * If required_final_offset > 0, only terminal states whose active last_offset equals
  * required_final_offset are accepted (enabling 0-byte stride passing via register BX).
- * If required_final_offset < 0, variable bit-width literals (4..8 bits) for ULTRA_128B are used.
+ * If required_final_offset < 0, Split-Range Variable-Bit Literals (DH = 1..63) for ULTRA_128B
+ * are used (and if required_final_offset <= -100, terminal last_offset <= 128 is enforced so BH=0xFF).
  */
 static int solve_exact_parse(
     const uint8_t *input_data,
@@ -316,10 +401,13 @@ static int solve_exact_parse(
     ParsePlan *plan_out
 ) {
     assert(input_size > 0);
-    int is_ultra128 = (required_final_offset < 0);
-    int lit_bits_per_byte = is_ultra128
-                          ? detect_buffer_literal_bits(input_data, input_size, wildcard_mask)
-                          : ZX0_LITERAL_BITS_PER_BYTE;
+    int req_bh_ff = (required_final_offset <= -100);
+    int raw_neg = req_bh_ff ? (required_final_offset + 100) : required_final_offset;
+    int dh_mode = (raw_neg < 0)
+                ? ((-raw_neg >= 1 && -raw_neg <= 63)
+                   ? -raw_neg
+                   : find_best_dh_sentinel(input_data, input_size, wildcard_mask))
+                : 0;
     if (required_final_offset < 0) {
         required_final_offset = 0;
     }
@@ -336,6 +424,24 @@ static int solve_exact_parse(
     }
     if (required_final_offset > max_window) {
         return 0;
+    }
+
+    int *lit_cum_bits = (int *)malloc((size_t)(input_size + 1) * sizeof(int));
+    assert(lit_cum_bits != NULL);
+    lit_cum_bits[0] = 0;
+    if (dh_mode > 0) {
+        DhSpec spec;
+        build_dh_spec(dh_mode, &spec);
+        for (int i = 0; i < input_size; i++) {
+            int b = (wildcard_mask != NULL && wildcard_mask[i] != 0)
+                  ? (int)spec.min_len
+                  : (spec.bit_len[input_data[i]] ? (int)spec.bit_len[input_data[i]] : 8);
+            lit_cum_bits[i + 1] = lit_cum_bits[i] + b;
+        }
+    } else {
+        for (int i = 0; i < input_size; i++) {
+            lit_cum_bits[i + 1] = (i + 1) * ZX0_LITERAL_BITS_PER_BYTE;
+        }
     }
 
     MonotonicFrontier *lit_frontiers = (MonotonicFrontier *)calloc((size_t)(max_window + 1), sizeof(MonotonicFrontier));
@@ -400,7 +506,7 @@ static int solve_exact_parse(
         }
         int loop_max_off = active_max_off < ZX0_INITIAL_OFFSET ? ZX0_INITIAL_OFFSET : active_max_off;
         int computed_best_len = 1;
-        int literal_pos_bits = lit_bits_per_byte * pos;
+        int literal_pos_bits = lit_cum_bits[pos];
         uint8_t cur_byte = input_data[pos - 1];
         uint8_t nxt_byte = (pos < input_size) ? input_data[pos] : 0;
 
@@ -550,6 +656,18 @@ static int solve_exact_parse(
             terminal_cost = final_mat_cost[required_final_offset];
             terminal_node = final_mat_node[required_final_offset];
         }
+    } else if (req_bh_ff) {
+        int max_term_off = max_window < 128 ? max_window : 128;
+        for (int off = 1; off <= max_term_off; off++) {
+            if (final_lit_cost[off] < terminal_cost) {
+                terminal_cost = final_lit_cost[off];
+                terminal_node = final_lit_node[off];
+            }
+            if (final_mat_cost[off] < terminal_cost) {
+                terminal_cost = final_mat_cost[off];
+                terminal_node = final_mat_node[off];
+            }
+        }
     } else {
         terminal_cost = best_any_cost[input_size];
         terminal_node = best_any_node[input_size];
@@ -579,6 +697,7 @@ static int solve_exact_parse(
     }
 
     node_pool_free(&pool);
+    free(lit_cum_bits);
     free(lit_frontiers);
     free(rep_frontiers);
     free(lit_min_base);
@@ -702,11 +821,15 @@ static uint8_t *encode_plan_to_stream(
 ) {
     int use_zx0_lsb_byte = (format != ULTRA_FORMAT_ADPK_77B);
     int total_raw_len = (plan->token_count > 0) ? plan->tokens[plan->token_count - 1].end_pos : 0;
-    int lit_bits = (format == ULTRA_FORMAT_ULTRA_128B)
-                 ? ((meta->literal_bits >= 4 && meta->literal_bits <= 8)
-                    ? meta->literal_bits
-                    : detect_buffer_literal_bits(working_input, total_raw_len, NULL))
-                 : ZX0_LITERAL_BITS_PER_BYTE;
+    int dh_sentinel = (format == ULTRA_FORMAT_ULTRA_128B)
+                    ? ((meta->dh_sentinel >= 1 && meta->dh_sentinel <= 63)
+                       ? meta->dh_sentinel
+                       : find_best_dh_sentinel(working_input, total_raw_len, NULL))
+                    : 0;
+    DhSpec dh_spec;
+    if (format == ULTRA_FORMAT_ULTRA_128B) {
+        build_dh_spec(dh_sentinel, &dh_spec);
+    }
 
     BitWriter bw;
     bit_writer_init(
@@ -720,7 +843,7 @@ static uint8_t *encode_plan_to_stream(
     } else if (format == ULTRA_FORMAT_ULTRA_128B) {
         bw.is_ultra128 = 1;
         bit_writer_put_byte(&bw, 0x01); /* Byte 0: bits 7..1 = first 7 bits, bit 0 = sentinel 1 */
-        bit_writer_put_byte(&bw, (uint8_t)(1 << (8 - lit_bits))); /* Byte 1: DH sentinel */
+        bit_writer_put_byte(&bw, (uint8_t)dh_sentinel); /* Byte 1: DH sentinel (adc al, 0 mode) */
         bw.bit_byte_index = 0;
         bw.bit_mask = 128;
     }
@@ -740,8 +863,11 @@ static uint8_t *encode_plan_to_stream(
             if (format == ULTRA_FORMAT_ULTRA_128B) {
                 for (int i = 0; i < length; i++) {
                     uint8_t b = working_input[input_pos++];
-                    for (int bit_idx = lit_bits - 1; bit_idx >= 0; bit_idx--) {
-                        bit_writer_put_bit(&bw, (b >> bit_idx) & 1);
+                    bit_writer_put_bit(&bw, dh_spec.prefix_bit[b]);
+                    int m = dh_spec.payload_len[b];
+                    int pv = dh_spec.payload_val[b];
+                    for (int bit_idx = m - 1; bit_idx >= 0; bit_idx--) {
+                        bit_writer_put_bit(&bw, (pv >> bit_idx) & 1);
                     }
                 }
             } else {
@@ -782,12 +908,19 @@ static uint8_t *encode_plan_to_stream(
         eof_symbol = ZX0_EOF_ALT_VALUE;
     } else if ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B) && meta->filter_passes > 0) {
         eof_symbol = (meta->filter_stride == 0) ? ZX0_EOF_E8_VALUE : ZX0_EOF_ALT_VALUE;
-    } else if ((format == ULTRA_FORMAT_ULTRA_128B || format == ULTRA_FORMAT_PRO_111B) && meta->filter_passes > 0) {
+    } else if (format == ULTRA_FORMAT_PRO_111B && meta->filter_passes > 0) {
         if (meta->filter_stride == 0) {
             int is_two_opcodes = (meta->filter_passes >= 2 && meta->filter_strides[1] == 0);
             eof_symbol = is_two_opcodes ? ZX0_EOF_ULTRA_E8E9_VALUE : ZX0_EOF_ULTRA_E8_VALUE;
         } else {
             eof_symbol = ZX0_EOF_ALT_VALUE;
+        }
+    } else if (format == ULTRA_FORMAT_ULTRA_128B && meta->filter_passes > 0) {
+        if (meta->filter_stride == 0) {
+            int is_two_opcodes = (meta->filter_passes >= 2 && meta->filter_strides[1] == 0);
+            eof_symbol = is_two_opcodes ? ZX0_EOF_ULTRA_E8E9_VALUE : ZX0_EOF_E8_VALUE;
+        } else {
+            eof_symbol = ZX0_EOF_MSB_VALUE;
         }
     }
     bit_writer_put_elias(&bw, eof_symbol, 1);
@@ -822,7 +955,7 @@ static uint8_t *encode_plan_to_stream(
             }
             bit_writer_put_u16_le(&bw, 0);
         }
-    } else if (format == ULTRA_FORMAT_ULTRA_128B || format == ULTRA_FORMAT_PRO_111B) {
+    } else if (format == ULTRA_FORMAT_PRO_111B) {
         if (meta->filter_passes > 0) {
             for (int p = 0; p < meta->filter_passes; p++) {
                 bit_writer_put_u16_le(&bw, (uint16_t)meta->filter_counts[p]);
@@ -835,6 +968,17 @@ static uint8_t *encode_plan_to_stream(
             }
             bit_writer_put_u16_le(&bw, 0);
         }
+    } else if (format == ULTRA_FORMAT_ULTRA_128B) {
+        for (int p = 0; p < meta->filter_passes; p++) {
+            bit_writer_put_u16_le(&bw, (uint16_t)meta->filter_counts[p]);
+            int st = meta->filter_strides[p];
+            if (st > 0) {
+                uint16_t packed_w = (uint16_t)((meta->filter_word_modes[p] ? 0x8000u : 0x0000u) |
+                                               ((unsigned int)(256 - st) & 0xFFu));
+                bit_writer_put_u16_le(&bw, packed_w);
+            }
+        }
+        bit_writer_put_u16_le(&bw, 0);
     }
 
     *out_size = bw.size;
@@ -960,7 +1104,12 @@ uint8_t *ultra_decompress_buffer(
         }
         if (format == ULTRA_FORMAT_ULTRA_128B) {
             for (int i = 0; i < lit_len; i++) {
-                int al = ultra_dh_sentinel;
+                int p_bit = bit_reader_get_bit(&br);
+                if (p_bit < 0) {
+                    free(out);
+                    return NULL;
+                }
+                int al = (ultra_dh_sentinel + p_bit) & 0xFF;
                 while (al < 256) {
                     int bit = bit_reader_get_bit(&br);
                     if (bit < 0) {
@@ -1133,17 +1282,24 @@ reached_eof:
                 out[di] = (uint8_t)(out[di] + out[di - (size_t)last_offset]);
             }
         }
-    } else if ((format == ULTRA_FORMAT_HYBRID_108B ||
-                format == ULTRA_FORMAT_PRO_111B ||
-                format == ULTRA_FORMAT_ULTRA_128B) &&
-               eof_msb_read > ZX0_EOF_MSB_VALUE) {
+    } else if (((format == ULTRA_FORMAT_HYBRID_108B ||
+                 format == ULTRA_FORMAT_PRO_111B) &&
+                eof_msb_read > ZX0_EOF_MSB_VALUE) ||
+               (format == ULTRA_FORMAT_ULTRA_128B &&
+                eof_msb_read >= ZX0_EOF_MSB_VALUE)) {
         int e8_stage = 0;
         if (format == ULTRA_FORMAT_HYBRID_108B) {
             e8_stage = (eof_msb_read == ZX0_EOF_E8_VALUE) ? 2 : 0;
-        } else {
+        } else if (format == ULTRA_FORMAT_PRO_111B) {
             if (eof_msb_read == ZX0_EOF_ULTRA_E8E9_VALUE) {
                 e8_stage = 2;
             } else if (eof_msb_read == ZX0_EOF_ULTRA_E8_VALUE) {
+                e8_stage = 1;
+            }
+        } else {
+            if (eof_msb_read == ZX0_EOF_ULTRA_E8E9_VALUE) {
+                e8_stage = 2;
+            } else if (eof_msb_read == ZX0_EOF_E8_VALUE) {
                 e8_stage = 1;
             }
         }

@@ -28,7 +28,7 @@
 
 /* Monotonic literal-frontier capacity: Elias gamma concavity guarantees <= 12 undominated split points */
 #define ULTRA_MAX_FRONTIER_SIZE     24
-#define ULTRA_MAX_FILTER_PASSES     6
+#define ULTRA_MAX_FILTER_PASSES     8
 
 /* Supported bitstream formats corresponding to verified x86-16 assembly decompressors */
 typedef enum {
@@ -40,7 +40,7 @@ typedef enum {
     ULTRA_FORMAT_X86E8_84B   = 5, /* 84-byte Zero-Overhead ZX0-compatible + x86 E8 Call-Target filter */
     ULTRA_FORMAT_UNIV_93B    = 6, /* 93-byte Universal Zero-Overhead ZX0 + Stride-Delta + x86 E8 filter */
     ULTRA_FORMAT_HYBRID_108B = 7, /* 108-byte Multi-Stage Hybrid 0B-Ovh ZX0 + E8/E9 + Free-BX 2D Stride */
-    ULTRA_FORMAT_ULTRA_128B  = 8, /* 128-byte Flagship Variable-Bit Literals + E8/E9 + 16-Bit/8-Bit 2D Stride */
+    ULTRA_FORMAT_ULTRA_128B  = 8, /* 128-byte Flagship Split-Range Variable-Bit Literals + E8/E9 + 16b/8b 2D Stride */
     ULTRA_FORMAT_PRO_111B    = 9  /* 111-byte Zero-Overhead ZX0 + E8/E9 + 16-Bit/8-Bit 2D Stride */
 } UltraFormat;
 
@@ -48,7 +48,8 @@ typedef struct {
     UltraFormat format;
     int offset_lsb_bits;                              /* 7 for standard ZX0; 1..12 for ULTRA_FORMAT_ADPK_77B */
     int literal_bits;                                 /* 8 for standard; 4..8 for ULTRA_FORMAT_ULTRA_128B */
-    int filter_passes;                                /* 0 = raw, 1..5 = active post-filter passes */
+    int dh_sentinel;                                  /* 1..63 DH sentinel for ULTRA_FORMAT_ULTRA_128B (adc al, 0) */
+    int filter_passes;                                /* 0 = raw, 1..8 = active post-filter passes */
     int filter_stride;                                /* Primary stride distance in bytes (0 for E8 call filter) */
     int filter_strides[ULTRA_MAX_FILTER_PASSES];      /* Per-pass stride (0 = E8/E9, 1..32768 = Stride-Delta) */
     int filter_counts[ULTRA_MAX_FILTER_PASSES];       /* Filtered tail byte count per integration pass */
