@@ -502,10 +502,9 @@ int ultra_solve_multi_asset_pack(
      * exact ZX0_V2 first to avoid redundant multi-stride sweeps on non-competitive permutations,
      * then evaluate the full target format exhaustively across all elite candidates in Phase 2.
      */
-    int use_fast_phase1_screen = (total_perms > MAX_ELITE_PERMUTATIONS) &&
-                                 (format == ULTRA_FORMAT_STRD_80B ||
-                                  format == ULTRA_FORMAT_STRD_82B ||
-                                  format == ULTRA_FORMAT_COMPAT_82B);
+    int use_fast_phase1_screen = (total_perms > 32) &&
+                                 (format != ULTRA_FORMAT_ZX0_V2 &&
+                                  format != ULTRA_FORMAT_ADPK_77B);
     UltraFormat phase1_format = use_fast_phase1_screen ? ULTRA_FORMAT_ZX0_V2 : format;
 
     #pragma omp parallel for schedule(dynamic, 16)
@@ -573,14 +572,15 @@ int ultra_solve_multi_asset_pack(
     if (use_fast_phase1_screen) {
         ultra_free_pack_solution(solution_out);
     }
-    int (*elite_perms)[MAX_PACK_ASSETS] = malloc(MAX_ELITE_PERMUTATIONS * sizeof(*elite_perms));
+    int max_elite_cap = use_fast_phase1_screen ? 16 : MAX_ELITE_PERMUTATIONS;
+    int (*elite_perms)[MAX_PACK_ASSETS] = malloc((size_t)max_elite_cap * sizeof(*elite_perms));
     assert(elite_perms != NULL);
     int elite_count = 0;
 
     for (size_t threshold = phase1_min_bytes;
-         threshold <= phase1_min_bytes + ELITE_BYTE_SLACK && elite_count < MAX_ELITE_PERMUTATIONS;
+         threshold <= phase1_min_bytes + ELITE_BYTE_SLACK && elite_count < max_elite_cap;
          threshold++) {
-        for (size_t idx = 0; idx < total_perms && elite_count < MAX_ELITE_PERMUTATIONS; idx++) {
+        for (size_t idx = 0; idx < total_perms && elite_count < max_elite_cap; idx++) {
             if (perm_scores[idx].best_bytes == threshold) {
                 memcpy(elite_perms[elite_count++], perm_scores[idx].perm, (size_t)active_count * sizeof(int));
             }
@@ -597,22 +597,64 @@ int ultra_solve_multi_asset_pack(
         int active_offs[MAX_PACK_ASSETS];
         assert(raw_buf != NULL && wc_buf != NULL);
 
-        /* 2A: Enumerate all partial overlap combinations (0 .. max_ov_g) across all boundaries */
+        /* 2A: Enumerate all valid partial overlap combinations (0 .. max_ov_g) across all boundaries */
         int total_ov_combos = 1;
         int radices[MAX_PACK_ASSETS];
+        int valid_ovs[MAX_PACK_ASSETS][64];
         for (int g = 0; g < active_count - 1; g++) {
-            radices[g] = max_ov_table[perm[g]][perm[g + 1]] + 1;
-            if (total_ov_combos <= 256) {
+            const UltraAsset *left_a = &assets[perm[g]];
+            const UltraAsset *right_a = &assets[perm[g + 1]];
+            int max_ov = max_ov_table[perm[g]][perm[g + 1]];
+            int cnt = 0;
+            if (max_ov > 0) {
+                valid_ovs[g][cnt++] = max_ov;
+            }
+            valid_ovs[g][cnt++] = 0;
+            for (int ov = max_ov - 1; ov >= 1 && cnt < 64; ov--) {
+                if (memcmp(left_a->data + left_a->length - ov, right_a->data, (size_t)ov) == 0) {
+                    valid_ovs[g][cnt++] = ov;
+                }
+            }
+            radices[g] = cnt;
+            if (total_ov_combos * radices[g] <= 64) {
                 total_ov_combos *= radices[g];
             } else {
                 radices[g] = 1;
             }
         }
 
+        int best_screen_combo = 0;
+        if (use_fast_phase1_screen && total_ov_combos > 1) {
+            int best_screen_bits = 0x3fffffff;
+            for (int combo = 0; combo < total_ov_combos; combo++) {
+                int rem = combo;
+                for (int g = 0; g < active_count - 1; g++) {
+                    base_gaps[g] = valid_ovs[g][rem % radices[g]];
+                    rem /= radices[g];
+                }
+                int raw_len = build_candidate_buffer(
+                    assets, perm, active_count, base_gaps, raw_buf, wc_buf, active_offs
+                );
+                size_t c_sz = 0;
+                UltraMetadata c_meta;
+                uint8_t *c_str = ultra_compress_buffer(
+                    raw_buf, raw_len, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &c_sz, &c_meta, NULL
+                );
+                free(c_str);
+                if (c_meta.compressed_bits < best_screen_bits) {
+                    best_screen_bits = c_meta.compressed_bits;
+                    best_screen_combo = combo;
+                }
+            }
+        }
+
         for (int combo = 0; combo < total_ov_combos; combo++) {
+            if (use_fast_phase1_screen && combo != 0 && combo != best_screen_combo) {
+                continue;
+            }
             int rem = combo;
             for (int g = 0; g < active_count - 1; g++) {
-                base_gaps[g] = rem % radices[g];
+                base_gaps[g] = valid_ovs[g][rem % radices[g]];
                 rem /= radices[g];
             }
 

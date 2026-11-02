@@ -291,7 +291,7 @@ static void build_dh_spec(int dh, DhSpec *spec) {
     const int p_order[2] = {1, 0};
     for (int pi = 0; pi < 2; pi++) {
         int p = p_order[pi];
-        int v = dh + p;
+        int v = (p == 0) ? dh : ((dh & 5) + 1);
         int k = 0;
         while ((1 << (k + 1)) <= v) {
             k++;
@@ -318,13 +318,11 @@ static int find_best_dh_sentinel(
     int input_size,
     const uint8_t *wildcard_mask
 ) {
-    int best_flat_dh = 2;
-    int best_flat_bits = input_size * 8;
-    int best_split_dh = -1;
-    int best_split_bits = input_size * 8;
+    int best_dh = 3;
+    int best_bits = input_size * 8;
     DhSpec spec;
 
-    for (int dh = 1; dh <= 63; dh++) {
+    for (int dh = 1; dh <= 127; dh++) {
         build_dh_spec(dh, &spec);
         int sum = 0;
         int ok = 1;
@@ -343,22 +341,12 @@ static int find_best_dh_sentinel(
         if (!ok) {
             continue;
         }
-        if ((dh & (dh + 1)) == 0) {
-            if (sum < best_split_bits) {
-                best_split_bits = sum;
-                best_split_dh = dh;
-            }
-        } else {
-            if (sum < best_flat_bits) {
-                best_flat_bits = sum;
-                best_flat_dh = dh;
-            }
+        if (sum < best_bits || (sum == best_bits && dh == 3)) {
+            best_bits = sum;
+            best_dh = dh;
         }
     }
-    if (best_split_dh > 0 && best_split_bits < best_flat_bits) {
-        return best_split_dh;
-    }
-    return best_flat_dh;
+    return best_dh;
 }
 
 static inline int detect_buffer_literal_bits(
@@ -388,8 +376,8 @@ static inline int detect_buffer_literal_bits(
  * and Topological Mark-and-Compact GC.
  * If required_final_offset > 0, only terminal states whose active last_offset equals
  * required_final_offset are accepted (enabling 0-byte stride passing via register BX).
- * If required_final_offset < 0, Split-Range Variable-Bit Literals (DH = 1..63) for ULTRA_128B
- * are used (and if required_final_offset <= -100, terminal last_offset <= 128 is enforced so BH=0xFF).
+ * If required_final_offset < 0, Asymmetric Split-Domain Variable-Bit Literals (DH = 1..127)
+ * for ULTRA_128B are used.
  */
 static int solve_exact_parse(
     const uint8_t *input_data,
@@ -401,10 +389,10 @@ static int solve_exact_parse(
     ParsePlan *plan_out
 ) {
     assert(input_size > 0);
-    int req_bh_ff = (required_final_offset <= -100);
-    int raw_neg = req_bh_ff ? (required_final_offset + 100) : required_final_offset;
+    int req_bh_ff = (required_final_offset == -300);
+    int raw_neg = required_final_offset;
     int dh_mode = (raw_neg < 0)
-                ? ((-raw_neg >= 1 && -raw_neg <= 63)
+                ? ((-raw_neg >= 1 && -raw_neg <= 127)
                    ? -raw_neg
                    : find_best_dh_sentinel(input_data, input_size, wildcard_mask))
                 : 0;
@@ -480,8 +468,10 @@ static int solve_exact_parse(
     int gc_threshold = NODE_POOL_GC_THRESHOLD;
 
     /* Seed initial state at pos = 0 with base_cost = -1 so first literal block has 0 control bits */
-    frontier_push(&lit_frontiers[ZX0_INITIAL_OFFSET], 0, -1, -1);
-    lit_min_base[ZX0_INITIAL_OFFSET] = -1;
+    if (dh_mode == 0) {
+        frontier_push(&lit_frontiers[ZX0_INITIAL_OFFSET], 0, -1, -1);
+        lit_min_base[ZX0_INITIAL_OFFSET] = -1;
+    }
     frontier_push(&lit_frontiers[0], 0, -1, -1);
     lit_min_base[0] = -1;
     best_any_cost[0] = COST_INFINITY;
@@ -822,7 +812,7 @@ static uint8_t *encode_plan_to_stream(
     int use_zx0_lsb_byte = (format != ULTRA_FORMAT_ADPK_77B);
     int total_raw_len = (plan->token_count > 0) ? plan->tokens[plan->token_count - 1].end_pos : 0;
     int dh_sentinel = (format == ULTRA_FORMAT_ULTRA_128B)
-                    ? ((meta->dh_sentinel >= 1 && meta->dh_sentinel <= 63)
+                    ? ((meta->dh_sentinel >= 1 && meta->dh_sentinel <= 127)
                        ? meta->dh_sentinel
                        : find_best_dh_sentinel(working_input, total_raw_len, NULL))
                     : 0;
@@ -843,12 +833,12 @@ static uint8_t *encode_plan_to_stream(
     } else if (format == ULTRA_FORMAT_ULTRA_128B) {
         bw.is_ultra128 = 1;
         bit_writer_put_byte(&bw, 0x01); /* Byte 0: bits 7..1 = first 7 bits, bit 0 = sentinel 1 */
-        bit_writer_put_byte(&bw, (uint8_t)dh_sentinel); /* Byte 1: DH sentinel (adc al, 0 mode) */
+        bit_writer_put_byte(&bw, (uint8_t)dh_sentinel); /* Byte 1: DH sentinel (Asymmetric Split-Domain) */
         bw.bit_byte_index = 0;
         bw.bit_mask = 128;
     }
 
-    int last_offset = ZX0_INITIAL_OFFSET;
+    int last_offset = (format == ULTRA_FORMAT_ULTRA_128B) ? 0 : ZX0_INITIAL_OFFSET;
     int input_pos = 0;
 
     for (int t = 0; t < plan->token_count; t++) {
@@ -917,10 +907,9 @@ static uint8_t *encode_plan_to_stream(
         }
     } else if (format == ULTRA_FORMAT_ULTRA_128B && meta->filter_passes > 0) {
         if (meta->filter_stride == 0) {
-            int is_two_opcodes = (meta->filter_passes >= 2 && meta->filter_strides[1] == 0);
-            eof_symbol = is_two_opcodes ? ZX0_EOF_ULTRA_E8E9_VALUE : ZX0_EOF_E8_VALUE;
+            eof_symbol = ZX0_EOF_E8_VALUE;
         } else {
-            eof_symbol = ZX0_EOF_MSB_VALUE;
+            eof_symbol = ZX0_EOF_ALT_VALUE;
         }
     }
     bit_writer_put_elias(&bw, eof_symbol, 1);
@@ -1092,7 +1081,7 @@ uint8_t *ultra_decompress_buffer(
         return NULL;
     }
     size_t out_pos = 0;
-    int last_offset = ZX0_INITIAL_OFFSET;
+    int last_offset = (format == ULTRA_FORMAT_ULTRA_128B) ? 0 : ZX0_INITIAL_OFFSET;
     int eof_msb_read = ZX0_EOF_MSB_VALUE;
 
     for (;;) {
@@ -1109,7 +1098,7 @@ uint8_t *ultra_decompress_buffer(
                     free(out);
                     return NULL;
                 }
-                int al = (ultra_dh_sentinel + p_bit) & 0xFF;
+                int al = (p_bit == 0) ? ultra_dh_sentinel : ((ultra_dh_sentinel & 5) + 1);
                 while (al < 256) {
                     int bit = bit_reader_get_bit(&br);
                     if (bit < 0) {
@@ -1629,7 +1618,7 @@ uint8_t *ultra_compress_buffer(
          */
         int is_word_capable = (format == ULTRA_FORMAT_ULTRA_128B || format == ULTRA_FORMAT_PRO_111B);
         int is_multi_stage  = (format == ULTRA_FORMAT_HYBRID_108B || is_word_capable);
-        int base_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -1 : 0;
+        int base_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -200 : 0;
         int base_payload_bits = 0;
         {
             ParsePlan base_plan = {NULL, 0, 0};
@@ -1637,10 +1626,57 @@ uint8_t *ultra_compress_buffer(
             assert(ok);
             base_payload_bits = base_plan.payload_bits;
             best_meta.compressed_bits = base_plan.payload_bits;
+            best_meta.dh_sentinel = (format == ULTRA_FORMAT_ULTRA_128B)
+                                  ? find_best_dh_sentinel(working_input, input_size, NULL) : 0;
             best_meta.literal_bits = (format == ULTRA_FORMAT_ULTRA_128B)
                                    ? detect_buffer_literal_bits(working_input, input_size, NULL) : 8;
             best_stream = encode_plan_to_stream(working_input, &base_plan, format, ZX0_DEFAULT_LSB_BITS, &best_meta, &best_size);
             free(base_plan.tokens);
+
+            if (format == ULTRA_FORMAT_ULTRA_128B) {
+                int alt_dhs[6] = {3, 4, 11, 16, 32, 64};
+                DhSpec spec_check;
+                for (int ai = 0; ai < 6; ai++) {
+                    int adh = alt_dhs[ai];
+                    if (adh == best_meta.dh_sentinel) {
+                        continue;
+                    }
+                    build_dh_spec(adh, &spec_check);
+                    int valid = 1;
+                    for (int i = 0; i < input_size; i++) {
+                        if (spec_check.bit_len[working_input[i]] == 0) {
+                            valid = 0;
+                            break;
+                        }
+                    }
+                    if (!valid) {
+                        continue;
+                    }
+                    ParsePlan alt_plan = {NULL, 0, 0};
+                    if (solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, -adh, &alt_plan)) {
+                        UltraMetadata alt_meta;
+                        memset(&alt_meta, 0, sizeof(alt_meta));
+                        alt_meta.format = format;
+                        alt_meta.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                        alt_meta.dh_sentinel = adh;
+                        alt_meta.literal_bits = detect_buffer_literal_bits(working_input, input_size, NULL);
+                        alt_meta.compressed_bits = alt_plan.payload_bits;
+                        size_t alt_size = 0;
+                        uint8_t *alt_stream = encode_plan_to_stream(working_input, &alt_plan, format, ZX0_DEFAULT_LSB_BITS, &alt_meta, &alt_size);
+                        free(alt_plan.tokens);
+                        if (alt_size < best_size ||
+                            (alt_size == best_size && alt_meta.compressed_bits < best_meta.compressed_bits)) {
+                            free(best_stream);
+                            best_stream = alt_stream;
+                            best_size = alt_size;
+                            best_meta = alt_meta;
+                            base_payload_bits = alt_meta.compressed_bits;
+                        } else {
+                            free(alt_stream);
+                        }
+                    }
+                }
+            }
         }
 
         uint8_t *best_e8_buf = NULL;
@@ -1761,14 +1797,22 @@ uint8_t *ultra_compress_buffer(
                         }
                     }
 
-                    /* For HYBRID_108B, PRO_111B, and ULTRA_128B: also evaluate chaining E8 (CALL rel16) + E9 (JMP rel16) */
-                    if (is_multi_stage &&
-                        e8_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
-                        e8_buf[input_size - 1] != X86_OPCODE_JMP_REL16) {
+                    /* For HYBRID_108B, PRO_111B, and ULTRA_128B: also evaluate chaining E8 (CALL rel16) + E9 (JMP rel16).
+                     * Since the decoder executes Pass 1 = E8 and Pass 2 = E9, the encoder must apply E9 first and E8 second.
+                     */
+                    if (is_multi_stage && format != ULTRA_FORMAT_ULTRA_128B &&
+                        working_input[input_size - 2] != X86_OPCODE_JMP_REL16 &&
+                        working_input[input_size - 1] != X86_OPCODE_JMP_REL16) {
+                        uint8_t *e9_tmp = (uint8_t *)malloc((size_t)input_size);
                         uint8_t *e8e9_buf = (uint8_t *)malloc((size_t)input_size);
-                        assert(e8e9_buf != NULL);
-                        int hits_e9 = apply_forward_x86_opcode_filter(e8_buf, e8e9_buf, input_size, tail_count, X86_OPCODE_JMP_REL16);
-                        if (hits_e9 >= 2) {
+                        assert(e9_tmp != NULL && e8e9_buf != NULL);
+                        int hits_e9 = apply_forward_x86_opcode_filter(working_input, e9_tmp, input_size, tail_count, X86_OPCODE_JMP_REL16);
+                        int hits_e8_2 = (hits_e9 >= 2 &&
+                                         e9_tmp[input_size - 2] != X86_OPCODE_CALL_REL16 &&
+                                         e9_tmp[input_size - 1] != X86_OPCODE_CALL_REL16)
+                                      ? apply_forward_x86_opcode_filter(e9_tmp, e8e9_buf, input_size, tail_count, X86_OPCODE_CALL_REL16)
+                                      : 0;
+                        if (hits_e9 >= 2 && hits_e8_2 >= 2) {
                             ParsePlan plan_e89 = {NULL, 0, 0};
                             if (solve_exact_parse(e8e9_buf, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_e89)) {
                                 UltraMetadata meta_e89;
@@ -1805,6 +1849,7 @@ uint8_t *ultra_compress_buffer(
                                 }
                             }
                         }
+                        free(e9_tmp);
                         free(e8e9_buf);
                     }
                 }
@@ -1814,9 +1859,11 @@ uint8_t *ultra_compress_buffer(
 
         /* B. Multi-core search over candidate strides (STRD_80B, COMPAT_82B, STRD_82B, UNIV_93B, HYBRID_108B, PRO_111B, ULTRA_128B) */
         if (format != ULTRA_FORMAT_X86E8_84B) {
+            int max_allowed_stride = (format == ULTRA_FORMAT_PRO_111B) ? 128 : (is_multi_stage ? 256 : 32640);
+            int stride_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300 : 0;
             int candidate_strides[112];
             int num_strides = 0;
-            for (int s = 1; s <= 64 && s < input_size; s++) {
+            for (int s = 1; s <= 64 && s < input_size && s <= max_allowed_stride; s++) {
                 candidate_strides[num_strides++] = s;
             }
             static const int extra_strides[] = {
@@ -1825,10 +1872,7 @@ uint8_t *ultra_compress_buffer(
             };
             for (size_t idx = 0; idx < sizeof(extra_strides) / sizeof(extra_strides[0]); idx++) {
                 int es = extra_strides[idx];
-                if (es < input_size) {
-                    if (is_multi_stage && es > 256) {
-                        continue;
-                    }
+                if (es < input_size && es <= max_allowed_stride) {
                     candidate_strides[num_strides++] = es;
                 }
             }
@@ -1839,7 +1883,7 @@ uint8_t *ultra_compress_buffer(
             #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
             for (int si = 0; si < num_strides; si++) {
                 int stride = candidate_strides[si];
-                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -1
+                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300
                                   : is_multi_stage ? 0 : stride;
                 int max_full_count = input_size - stride;
                 int full_count = max_full_count > 65535 ? 65535 : max_full_count;
@@ -2163,7 +2207,7 @@ uint8_t *ultra_compress_buffer(
                         apply_forward_word16_stride_difference(wcur, wnxt, input_size, wstride, max_wcount);
                         memcpy(wcur, wnxt, (size_t)input_size);
                         ParsePlan plan_w = {NULL, 0, 0};
-                        if (solve_exact_parse(wcur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_w)) {
+                        if (solve_exact_parse(wcur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_w)) {
                             UltraMetadata meta_w;
                             memset(&meta_w, 0, sizeof(meta_w));
                             meta_w.format = format;
@@ -2218,7 +2262,7 @@ uint8_t *ultra_compress_buffer(
                             wharm_counts[pass - 1] = whc;
                             if (pass >= 2) {
                                 ParsePlan plan_wh = {NULL, 0, 0};
-                                if (solve_exact_parse(wcur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_wh)) {
+                                if (solve_exact_parse(wcur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_wh)) {
                                     UltraMetadata meta_wh;
                                     memset(&meta_wh, 0, sizeof(meta_wh));
                                     meta_wh.format = format;
@@ -2273,7 +2317,7 @@ uint8_t *ultra_compress_buffer(
                                 if (bc <= 0) continue;
                                 apply_forward_stride_difference(wcur, wnxt, input_size, bs, bc);
                                 ParsePlan plan_wb = {NULL, 0, 0};
-                                if (solve_exact_parse(wnxt, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_wb)) {
+                                if (solve_exact_parse(wnxt, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_wb)) {
                                     UltraMetadata meta_wb;
                                     memset(&meta_wb, 0, sizeof(meta_wb));
                                     meta_wb.format = format;
@@ -2341,12 +2385,12 @@ uint8_t *ultra_compress_buffer(
 
                     for (size_t i2 = 0; i2 < sizeof(pair_s2) / sizeof(pair_s2[0]); i2++) {
                         int s2 = pair_s2[i2];
-                        if (s2 == s1 || s2 >= input_size) continue;
+                        if (s2 == s1 || s2 >= input_size || s2 > max_allowed_stride) continue;
                         if (s1 > 4 && s2 != s1 + 2 && s1 != s2 + 2) continue;
                         int c2 = (input_size - s2) > 65535 ? 65535 : (input_size - s2);
                         apply_forward_stride_difference(buf_p1, buf_p2, input_size, s2, c2);
                         ParsePlan plan_2d = {NULL, 0, 0};
-                        if (solve_exact_parse(buf_p2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_2d)) {
+                        if (solve_exact_parse(buf_p2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_2d)) {
                             UltraMetadata meta_2d;
                             memset(&meta_2d, 0, sizeof(meta_2d));
                             meta_2d.format = format;
@@ -2390,7 +2434,7 @@ uint8_t *ultra_compress_buffer(
                             if (c2 <= 0) continue;
                             apply_forward_stride_difference(buf_p2, buf_p3, input_size, s2, c2);
                             ParsePlan plan_3d = {NULL, 0, 0};
-                            if (solve_exact_parse(buf_p3, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_3d)) {
+                            if (solve_exact_parse(buf_p3, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_3d)) {
                                 UltraMetadata meta_3d;
                                 memset(&meta_3d, 0, sizeof(meta_3d));
                                 meta_3d.format = format;
@@ -2426,6 +2470,50 @@ uint8_t *ultra_compress_buffer(
                         }
                     }
                 }
+                if (is_word_capable && input_size > 68) {
+                    int wc1 = (input_size - 2) & ~1;
+                    apply_forward_word16_stride_difference(working_input, buf_p1, input_size, 2, wc1);
+                    static const int ws2_list[] = {4, 6, 8, 12, 16, 24, 30, 32, 48, 64, 128, 256};
+                    for (size_t wi2 = 0; wi2 < sizeof(ws2_list) / sizeof(ws2_list[0]); wi2++) {
+                        int s2 = ws2_list[wi2];
+                        if (s2 >= input_size - 2) continue;
+                        int wc2 = (input_size - 2 - s2) & ~1;
+                        if (wc2 < 2) continue;
+                        apply_forward_word16_stride_difference(buf_p1, buf_p2, input_size, s2, wc2);
+                        ParsePlan plan_w2d = {NULL, 0, 0};
+                        if (solve_exact_parse(buf_p2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_w2d)) {
+                            UltraMetadata meta_w2d;
+                            memset(&meta_w2d, 0, sizeof(meta_w2d));
+                            meta_w2d.format = format;
+                            meta_w2d.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                            meta_w2d.literal_bits = (format == ULTRA_FORMAT_ULTRA_128B)
+                                                  ? detect_buffer_literal_bits(buf_p2, input_size, NULL) : 8;
+                            meta_w2d.filter_passes = 2;
+                            meta_w2d.filter_stride = 2;
+                            meta_w2d.filter_strides[0] = s2;
+                            meta_w2d.filter_counts[0] = wc2;
+                            meta_w2d.filter_word_modes[0] = 1;
+                            meta_w2d.filter_strides[1] = 2;
+                            meta_w2d.filter_counts[1] = wc1;
+                            meta_w2d.filter_word_modes[1] = 1;
+                            meta_w2d.compressed_bits = plan_w2d.payload_bits;
+                            size_t size_w2d = 0;
+                            uint8_t *stream_w2d = encode_plan_to_stream(
+                                buf_p2, &plan_w2d, format, ZX0_DEFAULT_LSB_BITS, &meta_w2d, &size_w2d
+                            );
+                            free(plan_w2d.tokens);
+                            if (size_w2d < best_size ||
+                                (size_w2d == best_size && meta_w2d.compressed_bits < best_meta.compressed_bits)) {
+                                free(best_stream);
+                                best_stream = stream_w2d;
+                                best_size = size_w2d;
+                                best_meta = meta_w2d;
+                            } else {
+                                free(stream_w2d);
+                            }
+                        }
+                    }
+                }
                 free(buf_p1);
                 free(buf_p2);
                 free(buf_p3);
@@ -2455,7 +2543,7 @@ uint8_t *ultra_compress_buffer(
                                     );
                                     if (h8w >= 2) {
                                         ParsePlan plan_ew = {NULL, 0, 0};
-                                        if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_ew)) {
+                                        if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_ew)) {
                                             UltraMetadata meta_ew;
                                             memset(&meta_ew, 0, sizeof(meta_ew));
                                             meta_ew.format = format;
@@ -2507,7 +2595,7 @@ uint8_t *ultra_compress_buffer(
                                 );
                                 if (h8 >= 2) {
                                     ParsePlan plan_eb = {NULL, 0, 0};
-                                    if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_eb)) {
+                                    if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_eb)) {
                                         UltraMetadata meta_eb;
                                         memset(&meta_eb, 0, sizeof(meta_eb));
                                         meta_eb.format = format;
@@ -2580,7 +2668,7 @@ uint8_t *ultra_compress_buffer(
                                     );
                                     if (h8_direct >= 2) {
                                         ParsePlan plan_u1 = {NULL, 0, 0};
-                                        if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_u1)) {
+                                        if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_u1)) {
                                             UltraMetadata meta_u1;
                                             memset(&meta_u1, 0, sizeof(meta_u1));
                                             meta_u1.format = format;
@@ -2618,7 +2706,8 @@ uint8_t *ultra_compress_buffer(
 
                                 /* Decoder runs E8 -> E9 -> Stride, so encoder applies Stride -> E9 -> E8 */
                                 int e9_tail = 3;
-                                if (st_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
+                                if (format != ULTRA_FORMAT_ULTRA_128B &&
+                                    st_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
                                     st_buf[input_size - 1] != X86_OPCODE_JMP_REL16 &&
                                     st_buf[input_size - 3] != X86_OPCODE_JMP_REL16) {
                                     memcpy(e9_on_st, st_buf, (size_t)input_size);
@@ -2629,7 +2718,7 @@ uint8_t *ultra_compress_buffer(
                                         );
                                         if (h8 >= 2) {
                                             ParsePlan plan_hyb = {NULL, 0, 0};
-                                            if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, base_req_off, &plan_hyb)) {
+                                            if (solve_exact_parse(e8_on_st, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_hyb)) {
                                                 UltraMetadata meta_hyb;
                                                 memset(&meta_hyb, 0, sizeof(meta_hyb));
                                                 meta_hyb.format = format;
