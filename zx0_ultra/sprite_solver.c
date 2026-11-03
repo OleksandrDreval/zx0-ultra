@@ -412,11 +412,39 @@ int ultra_solve_multi_asset_pack(
         int cur_perm[MAX_PACK_ASSETS];
         memcpy(cur_perm, active_ids, (size_t)active_count * sizeof(int));
         size_t p_idx = 0;
+        int max_tot_ov = 0;
         do {
+            int tot_ov = 0;
+            for (int g = 0; g < active_count - 1; g++) {
+                tot_ov += max_ov_table[cur_perm[g]][cur_perm[g + 1]];
+            }
+            if (tot_ov > max_tot_ov) {
+                max_tot_ov = tot_ov;
+            }
             memcpy(all_perms[p_idx], cur_perm, (size_t)active_count * sizeof(int));
             p_idx++;
         } while (next_lexicographic_permutation(cur_perm, active_count));
         assert(p_idx == total_perms);
+
+        if (total_perms > 720 && max_tot_ov >= 5) {
+            int min_keep_ov = max_tot_ov - 4;
+            size_t kept = 0;
+            for (size_t idx = 0; idx < total_perms; idx++) {
+                int tot_ov = 0;
+                for (int g = 0; g < active_count - 1; g++) {
+                    tot_ov += max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
+                }
+                if (tot_ov >= min_keep_ov) {
+                    if (kept != idx) {
+                        memcpy(all_perms[kept], all_perms[idx], (size_t)active_count * sizeof(int));
+                    }
+                    kept++;
+                }
+            }
+            if (kept >= 32) {
+                total_perms = kept;
+            }
+        }
     } else {
         all_perms = malloc(MAX_HEURISTIC_PERMUTATIONS * sizeof(*all_perms));
         assert(all_perms != NULL);
@@ -425,12 +453,9 @@ int ultra_solve_multi_asset_pack(
         for (int u = 0; u < active_count; u++) {
             int aid = active_ids[u];
             size_t csz = 0;
-            UltraMetadata smeta;
-            uint8_t *cstream = ultra_compress_buffer(
-                assets[aid].data, assets[aid].length, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &csz, &smeta, NULL
-            );
-            free(cstream);
-            solo_bits[u] = smeta.compressed_bits;
+            int sbits = 0;
+            ultra_screen_zx0_v2(assets[aid].data, assets[aid].length, NULL, ZX0_MAX_OFFSET, &csz, &sbits);
+            solo_bits[u] = sbits;
         }
 
         int ov_weight[MAX_PACK_ASSETS][MAX_PACK_ASSETS];
@@ -460,16 +485,13 @@ int ultra_solve_multi_asset_pack(
 
             int plen = build_candidate_buffer(assets, pair_perm, 2, pair_gap, p_raw, p_wc, pair_offs);
             size_t pcsz = 0;
-            UltraMetadata pmeta;
-            uint8_t *pstream = ultra_compress_buffer(
-                p_raw, plen, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &pcsz, &pmeta, NULL
-            );
-            free(pstream);
+            int pbits = 0;
+            ultra_screen_zx0_v2(p_raw, plen, NULL, ZX0_MAX_OFFSET, &pcsz, &pbits);
             free(p_wc);
             free(p_raw);
 
             /* Add ZX0 EOF overhead back out so pairwise bit gain is strictly positive on helpful edges */
-            int saved_bits = (solo_bits[u] + solo_bits[v] - 18) - pmeta.compressed_bits;
+            int saved_bits = (solo_bits[u] + solo_bits[v] - 18) - pbits;
             lz_weight[u][v] = (saved_bits > 0 ? saved_bits * 4 : 0) + ov;
         }
 
@@ -506,57 +528,52 @@ int ultra_solve_multi_asset_pack(
                                  (format != ULTRA_FORMAT_ZX0_V2);
     UltraFormat phase1_format = use_fast_phase1_screen ? ULTRA_FORMAT_ZX0_V2 : format;
 
-    #pragma omp parallel for schedule(dynamic, 16)
-    for (int idx = 0; idx < (int)total_perms; idx++) {
+    #pragma omp parallel
+    {
         uint8_t *raw_buf = (uint8_t *)malloc((size_t)max_raw_capacity);
         uint8_t *wc_buf = (uint8_t *)malloc((size_t)max_raw_capacity);
         int gap_specs[MAX_PACK_ASSETS];
         int active_offs[MAX_PACK_ASSETS];
         assert(raw_buf != NULL && wc_buf != NULL);
 
-        size_t local_best_bytes = (size_t)-1;
-        int local_best_bits = 0x3fffffff;
+        #pragma omp for schedule(dynamic, 32)
+        for (int idx = 0; idx < (int)total_perms; idx++) {
+            for (int g = 0; g < active_count - 1; g++) {
+                gap_specs[g] = max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
+            }
 
-        for (int g = 0; g < active_count - 1; g++) {
-            gap_specs[g] = max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
-        }
-
-        int raw_len = build_candidate_buffer(
-            assets, all_perms[idx], active_count, gap_specs, raw_buf, wc_buf, active_offs
-        );
-        uint8_t *resolved = (uint8_t *)malloc((size_t)raw_len);
-        assert(resolved != NULL);
-
-        size_t comp_sz = 0;
-        UltraMetadata meta;
-        uint8_t *comp = ultra_compress_buffer(
-            raw_buf, raw_len, NULL, phase1_format, ZX0_MAX_OFFSET, &comp_sz, &meta, resolved
-        );
-
-        local_best_bytes = comp_sz;
-        local_best_bits = meta.compressed_bits;
-
-        #pragma omp critical
-        {
-            update_global_best(
-                solution_out, asset_count, contained_in, contained_rel_off,
-                all_perms[idx], active_count, active_offs, raw_len,
-                resolved, comp, comp_sz, &meta
+            int raw_len = build_candidate_buffer(
+                assets, all_perms[idx], active_count, gap_specs, raw_buf, wc_buf, active_offs
             );
-        }
 
-        memcpy(perm_scores[idx].perm, all_perms[idx], (size_t)active_count * sizeof(int));
-        perm_scores[idx].best_bytes = local_best_bytes;
-        perm_scores[idx].best_bits = local_best_bits;
+            size_t comp_sz = 0;
+            int comp_bits = 0;
+            if (phase1_format == ULTRA_FORMAT_ZX0_V2) {
+                ultra_screen_zx0_v2(raw_buf, raw_len, NULL, ZX0_MAX_OFFSET, &comp_sz, &comp_bits);
+            } else {
+                UltraMetadata meta;
+                uint8_t *comp = ultra_compress_buffer(
+                    raw_buf, raw_len, NULL, phase1_format, ZX0_MAX_OFFSET, &comp_sz, &meta, NULL
+                );
+                free(comp);
+                comp_bits = meta.compressed_bits;
+            }
+
+            memcpy(perm_scores[idx].perm, all_perms[idx], (size_t)active_count * sizeof(int));
+            perm_scores[idx].best_bytes = comp_sz;
+            perm_scores[idx].best_bits = comp_bits;
+        }
 
         free(raw_buf);
         free(wc_buf);
     }
 
-    /* Collect elite permutations within ELITE_BYTE_SLACK of Phase 1 best */
-    size_t phase1_min_bytes = solution_out->compressed_size;
-    if (use_fast_phase1_screen) {
-        ultra_free_pack_solution(solution_out);
+    /* Collect elite permutations within ELITE_BYTE_SLACK of Phase 1 best (breaking ties by best_bits) */
+    size_t phase1_min_bytes = (size_t)-1;
+    for (size_t idx = 0; idx < total_perms; idx++) {
+        if (perm_scores[idx].best_bytes < phase1_min_bytes) {
+            phase1_min_bytes = perm_scores[idx].best_bytes;
+        }
     }
     int max_elite_cap = use_fast_phase1_screen ? 8 : MAX_ELITE_PERMUTATIONS;
     int (*elite_perms)[MAX_PACK_ASSETS] = malloc((size_t)max_elite_cap * sizeof(*elite_perms));
@@ -566,10 +583,20 @@ int ultra_solve_multi_asset_pack(
     for (size_t threshold = phase1_min_bytes;
          threshold <= phase1_min_bytes + ELITE_BYTE_SLACK && elite_count < max_elite_cap;
          threshold++) {
-        for (size_t idx = 0; idx < total_perms && elite_count < max_elite_cap; idx++) {
-            if (perm_scores[idx].best_bytes == threshold) {
-                memcpy(elite_perms[elite_count++], perm_scores[idx].perm, (size_t)active_count * sizeof(int));
+        while (elite_count < max_elite_cap) {
+            size_t best_idx = (size_t)-1;
+            int min_bits = 0x3fffffff;
+            for (size_t idx = 0; idx < total_perms; idx++) {
+                if (perm_scores[idx].best_bytes == threshold && perm_scores[idx].best_bits < min_bits) {
+                    min_bits = perm_scores[idx].best_bits;
+                    best_idx = idx;
+                }
             }
+            if (best_idx == (size_t)-1) {
+                break;
+            }
+            memcpy(elite_perms[elite_count++], perm_scores[best_idx].perm, (size_t)active_count * sizeof(int));
+            perm_scores[best_idx].best_bytes = (size_t)-1;
         }
     }
 
@@ -622,13 +649,10 @@ int ultra_solve_multi_asset_pack(
                     assets, perm, active_count, base_gaps, raw_buf, wc_buf, active_offs
                 );
                 size_t c_sz = 0;
-                UltraMetadata c_meta;
-                uint8_t *c_str = ultra_compress_buffer(
-                    raw_buf, raw_len, NULL, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &c_sz, &c_meta, NULL
-                );
-                free(c_str);
-                if (c_meta.compressed_bits < best_screen_bits) {
-                    best_screen_bits = c_meta.compressed_bits;
+                int c_bits = 0;
+                ultra_screen_zx0_v2(raw_buf, raw_len, NULL, ZX0_MAX_OFFSET, &c_sz, &c_bits);
+                if (c_bits < best_screen_bits) {
+                    best_screen_bits = c_bits;
                     best_screen_combo = combo;
                 }
             }
@@ -680,13 +704,10 @@ int ultra_solve_multi_asset_pack(
                             assets, perm, active_count, base_gaps, raw_buf, wc_buf, active_offs
                         );
                         size_t c_sz = 0;
-                        UltraMetadata c_meta;
-                        uint8_t *c_str = ultra_compress_buffer(
-                            raw_buf, raw_len, wc_buf, ULTRA_FORMAT_ZX0_V2, ZX0_MAX_OFFSET, &c_sz, &c_meta, NULL
-                        );
-                        free(c_str);
-                        if (c_meta.compressed_bits < best_wb_bits) {
-                            best_wb_bits = c_meta.compressed_bits;
+                        int c_bits = 0;
+                        ultra_screen_zx0_v2(raw_buf, raw_len, wc_buf, ZX0_MAX_OFFSET, &c_sz, &c_bits);
+                        if (c_bits < best_wb_bits) {
+                            best_wb_bits = c_bits;
                             best_b_slot = bridge_slot;
                             best_b_wlen = wlen;
                         }

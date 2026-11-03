@@ -74,6 +74,20 @@ uint8_t *ultra_compress_buffer(
 );
 
 /*
+ * Fast zero-allocation exact cost-only evaluation for ULTRA_FORMAT_ZX0_V2.
+ * Computes exact compressed byte size and payload bit count without building
+ * backpointer nodes, bitstream buffers, or round-trip verification buffers.
+ */
+int ultra_screen_zx0_v2(
+    const uint8_t *input_data,
+    int input_size,
+    const uint8_t *wildcard_mask,
+    int max_offset_limit,
+    size_t *compressed_size_out,
+    int *compressed_bits_out
+);
+
+/*
  * Decompress any ZX0_V2, ADPK_77B, STRD_80B, or STRD_82B buffer in memory for self-verification.
  * Returns newly allocated output buffer of size expected_output_size, or NULL on error.
  */
