@@ -319,9 +319,11 @@ int main(int argc, char **argv) {
     } else if ((format == ULTRA_FORMAT_X86E8_84B ||
                 ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_stride == 0)) &&
                meta.filter_passes > 0) {
-        if ((format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B || format == ULTRA_FORMAT_ULTRA_128B) && meta.filter_passes > 2) {
+        int e8_passes = (meta.filter_passes >= 2 && meta.filter_strides[1] == 0) ? 2 : 1;
+        if (meta.filter_passes > e8_passes) {
             printf(" [e8_tail=%d, stride=%d, passes=%d, tail=%d]",
-                   meta.filter_counts[0], meta.filter_strides[2], meta.filter_passes - 2, meta.filter_counts[2]);
+                   meta.filter_counts[0], meta.filter_strides[e8_passes],
+                   meta.filter_passes - e8_passes, meta.filter_counts[e8_passes]);
         } else {
             printf(" [e8_tail=%d]", meta.filter_counts[0]);
         }
