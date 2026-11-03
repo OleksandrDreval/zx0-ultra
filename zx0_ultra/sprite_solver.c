@@ -19,9 +19,9 @@ static inline int omp_in_parallel(void) { return 0; }
 
 #define MAX_PACK_ASSETS                 14
 #define EXACT_FACTORIAL_ASSET_LIMIT     8
-#define MAX_HEURISTIC_PERMUTATIONS      768
+#define MAX_HEURISTIC_PERMUTATIONS      256
 #define ELITE_BYTE_SLACK                4
-#define MAX_ELITE_PERMUTATIONS          32
+#define MAX_ELITE_PERMUTATIONS          8
 #define MAX_WILDCARD_BRIDGE_LEN         4
 
 static int compute_max_overlap(const UltraAsset *left, const UltraAsset *right) {
@@ -517,45 +517,32 @@ int ultra_solve_multi_asset_pack(
         size_t local_best_bytes = (size_t)-1;
         int local_best_bits = 0x3fffffff;
 
-        for (int mode = 0; mode < 2; mode++) {
-            int has_any_ov = 0;
-            for (int g = 0; g < active_count - 1; g++) {
-                int ov = max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
-                gap_specs[g] = (mode == 0) ? ov : 0;
-                if (ov > 0) {
-                    has_any_ov = 1;
-                }
-            }
-            if (mode == 1 && !has_any_ov) {
-                continue;
-            }
+        for (int g = 0; g < active_count - 1; g++) {
+            gap_specs[g] = max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
+        }
 
-            int raw_len = build_candidate_buffer(
-                assets, all_perms[idx], active_count, gap_specs, raw_buf, wc_buf, active_offs
+        int raw_len = build_candidate_buffer(
+            assets, all_perms[idx], active_count, gap_specs, raw_buf, wc_buf, active_offs
+        );
+        uint8_t *resolved = (uint8_t *)malloc((size_t)raw_len);
+        assert(resolved != NULL);
+
+        size_t comp_sz = 0;
+        UltraMetadata meta;
+        uint8_t *comp = ultra_compress_buffer(
+            raw_buf, raw_len, NULL, phase1_format, ZX0_MAX_OFFSET, &comp_sz, &meta, resolved
+        );
+
+        local_best_bytes = comp_sz;
+        local_best_bits = meta.compressed_bits;
+
+        #pragma omp critical
+        {
+            update_global_best(
+                solution_out, asset_count, contained_in, contained_rel_off,
+                all_perms[idx], active_count, active_offs, raw_len,
+                resolved, comp, comp_sz, &meta
             );
-            uint8_t *resolved = (uint8_t *)malloc((size_t)raw_len);
-            assert(resolved != NULL);
-
-            size_t comp_sz = 0;
-            UltraMetadata meta;
-            uint8_t *comp = ultra_compress_buffer(
-                raw_buf, raw_len, NULL, phase1_format, ZX0_MAX_OFFSET, &comp_sz, &meta, resolved
-            );
-
-            if (comp_sz < local_best_bytes ||
-                (comp_sz == local_best_bytes && meta.compressed_bits < local_best_bits)) {
-                local_best_bytes = comp_sz;
-                local_best_bits = meta.compressed_bits;
-            }
-
-            #pragma omp critical
-            {
-                update_global_best(
-                    solution_out, asset_count, contained_in, contained_rel_off,
-                    all_perms[idx], active_count, active_offs, raw_len,
-                    resolved, comp, comp_sz, &meta
-                );
-            }
         }
 
         memcpy(perm_scores[idx].perm, all_perms[idx], (size_t)active_count * sizeof(int));

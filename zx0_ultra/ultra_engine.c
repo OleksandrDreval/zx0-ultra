@@ -790,7 +790,7 @@ static int solve_exact_parse(
                 }
 
                 int skip_new_off = 0;
-                if (max_ml_seen >= 64 && ml <= max_ml_seen && off != required_final_offset) {
+                if (max_ml_seen >= 48 && ml <= max_ml_seen && off != required_final_offset) {
                     skip_new_off = 1;
                     if (min_base == COST_INFINITY) {
                         continue;
@@ -2340,9 +2340,13 @@ uint8_t *ultra_compress_buffer(
             int max_allowed_stride = (format == ULTRA_FORMAT_PRO_111B) ? 128 : (is_multi_stage ? 256 : 32640);
             int stride_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300 : 0;
             int candidate_strides[112];
+            int cand_kg[112];
+            int cand_df[112];
             int num_strides = 0;
+            int raw_strides[112];
+            int n_raw_strides = 0;
             for (int s = 1; s <= 64 && s < input_size && s <= max_allowed_stride; s++) {
-                candidate_strides[num_strides++] = s;
+                raw_strides[n_raw_strides++] = s;
             }
             static const int extra_strides[] = {
                 68, 72, 75, 80, 84, 90, 96, 100, 108, 112, 120, 128,
@@ -2351,30 +2355,19 @@ uint8_t *ultra_compress_buffer(
             for (size_t idx = 0; idx < sizeof(extra_strides) / sizeof(extra_strides[0]); idx++) {
                 int es = extra_strides[idx];
                 if (es < input_size && es <= max_allowed_stride) {
-                    candidate_strides[num_strides++] = es;
+                    raw_strides[n_raw_strides++] = es;
                 }
             }
 
-            int max_passes = (format == ULTRA_FORMAT_STRD_82B || is_multi_stage) ? 5 : 1;
-            int nested_parallel = omp_in_parallel();
-
-            #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
-            for (int si = 0; si < num_strides; si++) {
-                int stride = candidate_strides[si];
-                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300
-                                  : is_multi_stage ? 0 : stride;
+            for (int rsi = 0; rsi < n_raw_strides; rsi++) {
+                int stride = raw_strides[rsi];
                 int max_full_count = input_size - stride;
                 int full_count = max_full_count > 65535 ? 65535 : max_full_count;
                 if (full_count <= 0) {
                     continue;
                 }
-
                 int kadane_gain = 0;
-                int unbiased_tail = 0;
-                int kadane_tail = find_optimal_stride_tail_count(
-                    working_input, input_size, stride, &kadane_gain, &unbiased_tail
-                );
-
+                find_optimal_stride_tail_count(working_input, input_size, stride, &kadane_gain, NULL);
                 int is_structural_stride = (stride == 1 || stride == 2 || stride == 3 || stride == 4 ||
                                             stride == 6 || stride == 8 || stride == 9 || stride == 10 ||
                                             stride == 12 || stride == 15 || stride == 16 || stride == 18 ||
@@ -2403,9 +2396,49 @@ uint8_t *ultra_compress_buffer(
                         eq_dif++;
                     }
                 }
-                if (stride > 8 && kadane_gain < 16 && (!is_structural_stride || eq_dif * 4 < eq_raw * 3)) {
+                int df_gain = eq_dif - eq_raw;
+                if ((stride > 2 && kadane_gain < 16 && df_gain < (input_size - stride) / 16) ||
+                    (stride > 8 && kadane_gain < 16 && !is_structural_stride)) {
                     continue;
                 }
+                int dominated_harmonic = 0;
+                if (stride > 24) {
+                    for (int prev_i = 0; prev_i < num_strides; prev_i++) {
+                        int d = candidate_strides[prev_i];
+                        if (d >= 2 && stride > d && (stride % d == 0) &&
+                            cand_kg[prev_i] >= 300 &&
+                            kadane_gain <= cand_kg[prev_i] + 64 &&
+                            df_gain <= cand_df[prev_i] + 64) {
+                            dominated_harmonic = 1;
+                            break;
+                        }
+                    }
+                }
+                if (dominated_harmonic) {
+                    continue;
+                }
+                candidate_strides[num_strides] = stride;
+                cand_kg[num_strides] = kadane_gain;
+                cand_df[num_strides] = df_gain;
+                num_strides++;
+            }
+
+            int max_passes = (format == ULTRA_FORMAT_STRD_82B || is_multi_stage) ? 5 : 1;
+            int nested_parallel = omp_in_parallel();
+
+            #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
+            for (int si = 0; si < num_strides; si++) {
+                int stride = candidate_strides[si];
+                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300
+                                  : is_multi_stage ? 0 : stride;
+                int max_full_count = input_size - stride;
+                int full_count = max_full_count > 65535 ? 65535 : max_full_count;
+
+                int kadane_gain = 0;
+                int unbiased_tail = 0;
+                int kadane_tail = find_optimal_stride_tail_count(
+                    working_input, input_size, stride, &kadane_gain, &unbiased_tail
+                );
 
                 uint8_t *cur_buf = (uint8_t *)malloc((size_t)input_size);
                 uint8_t *nxt_buf = (uint8_t *)malloc((size_t)input_size);
@@ -2684,7 +2717,7 @@ uint8_t *ultra_compress_buffer(
             }
 
             /* C0. PRO_111B & ULTRA_128B Native 16-Bit Word-Stride-Delta Search (eliminates carry-ripple on 16-bit PCM/Coord/Ptr tables) */
-            if (is_word_capable && input_size >= 4) {
+            if (is_word_capable && input_size >= 4 && best_meta.compressed_bits > 200) {
                 static const int word_strides[] = {2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 32, 36, 40, 48, 64, 80, 96, 128};
                 int n_ws = (int)(sizeof(word_strides) / sizeof(word_strides[0]));
                 #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
@@ -2696,6 +2729,27 @@ uint8_t *ultra_compress_buffer(
                     int max_wcount = ((input_size - wstride) & ~1);
                     if (max_wcount < 2 || max_wcount > 65534) {
                         continue;
+                    }
+                    {
+                        int eq_b = 0, eq_w = 0, eq_raw_w = 0;
+                        for (int k = wstride; k + 1 < input_size; k += 2) {
+                            uint8_t b0 = (uint8_t)(working_input[k] - working_input[k - wstride]);
+                            uint8_t b1 = (uint8_t)(working_input[k + 1] - working_input[k + 1 - wstride]);
+                            uint16_t wcur_v = (uint16_t)(working_input[k] | (working_input[k + 1] << 8));
+                            uint16_t wprv_v = (uint16_t)(working_input[k - wstride] | (working_input[k + 1 - wstride] << 8));
+                            uint16_t wdif_v = (uint16_t)(wcur_v - wprv_v);
+                            if (working_input[k] == 0 || (k >= 2 && working_input[k] == working_input[k - 2])) eq_raw_w++;
+                            if (working_input[k + 1] == 0 || (k >= 2 && working_input[k + 1] == working_input[k - 1])) eq_raw_w++;
+                            if (b0 == 0) eq_b++;
+                            if (b1 == 0) eq_b++;
+                            if ((wdif_v & 0xFFu) == 0) eq_w++;
+                            if ((wdif_v >> 8) == 0 || (wdif_v >> 8) == 0xFFu) eq_w++;
+                        }
+                        if ((wstride == 2 && eq_w <= eq_b && eq_w <= eq_raw_w) ||
+                            (wstride > 2 && (eq_w <= eq_b + (input_size - wstride) / 64 ||
+                                             eq_w <= eq_raw_w + (input_size - wstride) / 16))) {
+                            continue;
+                        }
                     }
                     uint8_t *wcur = (uint8_t *)malloc((size_t)input_size);
                     uint8_t *wnxt = (uint8_t *)malloc((size_t)input_size);
@@ -2887,7 +2941,7 @@ uint8_t *ultra_compress_buffer(
              *    1) True 2D/3D Spatial Prediction (stride S1 followed by distinct stride S2, and (S1, S1, S2))
              *    2) Chained x86 E8 + E9 + Multi-Segment 2D Stride-Delta (including 16-bit Word-Stride on PRO_111B/ULTRA_128B)
              */
-            if (is_multi_stage) {
+            if (is_multi_stage && best_meta.compressed_bits > 300) {
                 static const int pair_s1[] = {1, 2, 3, 4, 6, 8, 12, 16, 30, 32};
                 static const int pair_s2[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 30, 32, 48, 64, 128, 256};
                 int n_s1 = (int)(sizeof(pair_s1) / sizeof(pair_s1[0]));
@@ -2910,6 +2964,10 @@ uint8_t *ultra_compress_buffer(
                         continue;
                     }
 
+                    int kept_s2[16];
+                    int kept_g2[16];
+                    int n_kept_s2 = 0;
+
                     for (int i2 = 0; i2 < n_s2; i2++) {
                         int s2 = pair_s2[i2];
                         if (s2 == s1 || s2 >= input_size || s2 > max_allowed_stride) continue;
@@ -2917,6 +2975,41 @@ uint8_t *ultra_compress_buffer(
                         int c2 = (input_size - s2) > 65535 ? 65535 : (input_size - s2);
                         apply_forward_stride_difference(buf_p1, buf_p2, input_size, s2, c2);
                         if (memcmp(buf_p2, buf_p1, (size_t)input_size) == 0) continue;
+                        int eq_p0 = 0, eq_p1 = 0, eq_p2 = 0;
+                        int start_k = (s1 > s2 ? s1 : s2) + 1;
+                        for (int k = start_k; k < input_size; k++) {
+                            if (working_input[k] == 0 || working_input[k] == working_input[k - 1] ||
+                                working_input[k] == working_input[k - s1] || working_input[k] == working_input[k - s2]) {
+                                eq_p0++;
+                            }
+                            if (buf_p1[k] == 0 || buf_p1[k] == buf_p1[k - 1] || buf_p1[k] == buf_p1[k - s1]) {
+                                eq_p1++;
+                            }
+                            if (buf_p2[k] == 0 || buf_p2[k] == buf_p2[k - 1] || buf_p2[k] == buf_p2[k - s2]) {
+                                eq_p2++;
+                            }
+                        }
+                        if (eq_p2 <= eq_p1 || eq_p2 <= eq_p0 + (input_size - start_k) / 16) {
+                            continue;
+                        }
+                        int gain2 = eq_p2 - eq_p1;
+                        int dom_s2 = 0;
+                        if (s2 > 32) {
+                            for (int kp = 0; kp < n_kept_s2; kp++) {
+                                int d2 = kept_s2[kp];
+                                if (d2 >= 2 && s2 > d2 && (s2 % d2 == 0) &&
+                                    kept_g2[kp] >= 120 && gain2 <= kept_g2[kp] + 32) {
+                                    dom_s2 = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (dom_s2) {
+                            continue;
+                        }
+                        kept_s2[n_kept_s2] = s2;
+                        kept_g2[n_kept_s2] = gain2;
+                        n_kept_s2++;
                         ParsePlan plan_2d = {NULL, 0, 0};
                         if (solve_exact_parse(buf_p2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_2d)) {
                             UltraMetadata meta_2d;
@@ -2966,6 +3059,12 @@ uint8_t *ultra_compress_buffer(
                                 if (c2 <= 0) continue;
                                 apply_forward_stride_difference(buf_p2, buf_p3, input_size, s2, c2);
                                 if (memcmp(buf_p3, buf_p2, (size_t)input_size) == 0) continue;
+                                int eq_p2b = 0, eq_p3b = 0;
+                                for (int k = s2 + 1; k < input_size; k++) {
+                                    if (buf_p2[k] == 0 || buf_p2[k] == buf_p2[k - 1]) eq_p2b++;
+                                    if (buf_p3[k] == 0 || buf_p3[k] == buf_p3[k - 1] || buf_p3[k] == buf_p3[k - s2]) eq_p3b++;
+                                }
+                                if (eq_p3b <= eq_p2b) continue;
                                 ParsePlan plan_3d = {NULL, 0, 0};
                                 if (solve_exact_parse(buf_p3, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_3d)) {
                                     UltraMetadata meta_3d;
@@ -3030,6 +3129,15 @@ uint8_t *ultra_compress_buffer(
                             assert(buf_w2 != NULL);
                             apply_forward_word16_stride_difference(buf_w1, buf_w2, input_size, s2, wc2);
                             if (memcmp(buf_w2, buf_w1, (size_t)input_size) == 0) {
+                                free(buf_w2);
+                                continue;
+                            }
+                            int eq_w1 = 0, eq_w2 = 0;
+                            for (int k = s2 + 2; k < input_size; k++) {
+                                if (buf_w1[k] == 0 || buf_w1[k] == buf_w1[k - 2]) eq_w1++;
+                                if (buf_w2[k] == 0 || buf_w2[k] == buf_w2[k - 2] || buf_w2[k] == buf_w2[k - s2]) eq_w2++;
+                            }
+                            if (eq_w2 <= eq_w1) {
                                 free(buf_w2);
                                 continue;
                             }
