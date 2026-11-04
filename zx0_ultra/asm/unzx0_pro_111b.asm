@@ -1,7 +1,7 @@
 ;--------------------------------------------------------------------------------------------------
 ; Routine Name: dzx0 (unzx0_pro_111b.asm)
-; Description: 109-byte Zero-Overhead Multi-Stage 2D + 16-Bit Word/8-Bit Byte x86-16 decompressor
-;              unifying FOUR decompression paradigms in 109 bytes (+39B vs 70B baseline):
+; Description: 111-byte Zero-Overhead Multi-Stage 2D + 16-Bit Word/8-Bit Byte x86-16 decompressor
+;              unifying FOUR decompression paradigms in 111 bytes (+41B vs 70B baseline):
 ;              - Mode 0 (V=256, CX=0xFF00): Standard 0-byte-overhead ZX0 v2 EOF.
 ;                'inc ch' sets CH=0x00 (ZF=1), 'jz .done' returns immediately with ZERO
 ;                trailing bytes in the stream (100% backward-compatible with all ZX0 v2 files!).
@@ -17,7 +17,7 @@
 ; Credits & Copyright:
 ;   - Algorithm: ZX0 by Einar Saukas (c) 2021 (BSD 3-Clause)
 ;   - Reference 8088 architecture: Emmanuel Marty (unzx0_8088.S, c 2021, zlib License)
-;   - 109B Zero-Overhead 16b/8b 2D + E8/E9 Pro size-coding: Oleksandr Dreval (MIT License)
+;   - 111B Zero-Overhead 16b/8b 2D + E8/E9 Pro size-coding: Oleksandr Dreval (MIT License)
 ;
 ; License: MIT (SPDX-License-Identifier: MIT)
 ;--------------------------------------------------------------------------------------------------
