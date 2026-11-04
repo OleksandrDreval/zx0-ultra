@@ -1,5 +1,5 @@
 ;--------------------------------------------------------------------------------------------------
-; Routine Name: dzx0 (unzx0_adpk_77b.asm)
+; Routine Name: dzx0 (unzx0_adpk_78b.asm)
 ; Description: 78-byte Adaptive-k Offset ZX0-Ultra decompressor (+8 bytes vs 70-byte baseline).
 ;              Reads a 1-byte stream header specifying k in 1..8 offset LSB bits per NEW_OFFSET,
 ;              eliminating wasted offset bits on compact sprite/tile/embedded dictionaries while

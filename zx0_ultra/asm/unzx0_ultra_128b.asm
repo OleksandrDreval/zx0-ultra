@@ -11,16 +11,18 @@
 ;                (selecting full 8-bit fallback [0..255] when (DH & 5)==0, 7-bit ASCII fallback
 ;                [0..127] when (DH & 5)==1, or 6-bit fallback [64..127] when (DH & 5)==4).
 ;              - Algebraic Multi-Mode EOF Dispatch & Fall-Through E8/E9 Post-Filter:
-;                - Mode 0 (V=256): Enters .mp_loop directly in .floop (inc ch -> 0x00, inc ax ->
-;                  0x0001, SF=0), or terminates on 0x0000 count word.
-;                - Mode 1 (V=281): Runs 1 pass of .e8_loop (AL=0xE8, CALL rel16), then transitions
-;                  to .floop (inc ch -> 0x00).
-;                - Mode 2 (V=537): Runs Pass 1 (AL=0xE8, CALL rel16) and Pass 2 (AL=0xE9,
-;                  JMP rel16), then transitions automatically to .floop on Pass 3+.
+;                - Mode 0 (V=256 / V=257): Enters .mp_loop directly in .floop (for V=257, AH=0xFE
+;                  so 'sahf' sets CF=0; for V=256 unfiltered, 0x0000 count exits via 'jcxz .done').
+;                - Mode 1 (V=536 / V=535): For V=536 (CX=0xFDE8) or V=535 (CX=0xFDE9), AH=0xFD has
+;                  bit 0 = 1 so 'sahf' sets CF=1 ('jc .e8_loop'), running 1 pass of .e8_loop with
+;                  AL=0xE8 (CALL rel16) or AL=0xE9 (JMP rel16), leaving CX=0x0000 so Pass 2+ has
+;                  AH=0x00 (CF=0) and transitions automatically to .floop.
 ;              - Compact 4-Byte-Per-Pass 16-Bit Word / 8-Bit Byte 2D Stride Integrator (1..128):
 ;                Reads count_u16 + packed mode_stride_u16 (AL = 256 - stride, AH = 0x80 for 16-bit
-;                Word-mode or 0x00 for 8-bit Byte-mode) and sign-extends AL via 'cbw / xchg ax, bx'
-;                with zero constraints on the final match offset BX prior to EOF.
+;                Word-mode or 0x00 for 8-bit Byte-mode), sets DX = 0x0000 (8-bit) or 0xFFFF (16-bit)
+;                via 'cwd', and sign-extends AL via 'cbw / xchg ax, bx' (BH = 0xFF guaranteed!)
+;                with zero constraints on the final match offset BX prior to EOF and full 64KB
+;                (up to 65,535 bytes) count support via 'inc dx / jnz .fnext / ... / dec dx'.
 ;
 ; Credits & Copyright:
 ;   - Algorithm: ZX0 by Einar Saukas (c) 2021 (BSD 3-Clause)
@@ -116,22 +118,23 @@ dzx0:
     xchg ax, cx
     jcxz .done
     sub di, cx
-    cbw
-    inc ax
-    js .e8_loop
+    sahf
+    jc .e8_loop
     lodsw
-    xchg ax, dx
-    mov bl, dl
+    cwd
+    cbw
+    xchg ax, bx
 
 .floop:
     mov ax, [bx+di]
     add [di], al
     inc di
     inc dx
-    jns .fnext
+    jnz .fnext
     adc [di], ah
     inc di
     dec cx
+    dec dx
 
 .fnext:
     loop .floop

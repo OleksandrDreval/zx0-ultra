@@ -81,7 +81,7 @@ static const char *format_label(UltraFormat fmt) {
         case ULTRA_FORMAT_COMPAT_82B:  return "COMPAT-82B (0B-Ovh + Stride)";
         case ULTRA_FORMAT_X86E8_84B:   return "X86E8-84B (0B-Ovh + E8 Call)";
         case ULTRA_FORMAT_UNIV_93B:    return "UNIV-93B (0B-Ovh + Stride + E8)";
-        case ULTRA_FORMAT_HYBRID_108B: return "HYBRID-108B (0B-Ovh + E8/E9 + 2D Stride)";
+        case ULTRA_FORMAT_HYBRID_108B: return "HYBRID-104B (0B-Ovh + E8/E9 + 2D Stride)";
         case ULTRA_FORMAT_PRO_111B:    return "PRO-111B (0B-Ovh + E8/E9 + 16b/8b 2D Stride)";
         case ULTRA_FORMAT_ULTRA_128B:  return "ULTRA-128B (VarLit + E8/E9 + 16b/8b 2D Stride)";
         default:                       return "Unknown";
@@ -97,13 +97,13 @@ static void print_usage(const char *prog) {
         "  %s --pack [format_flag] [--no-wildcards] -o <output.zx0u> [--raw-out <layout.bin>] <asset1> <asset2> ...\n"
         "\nFormat flags:\n"
         "  --zx0        Standard ZX0 v2 bitstream (default; 100%% compatible with 67B/70B unzx0_x86.asm)\n"
-        "  --adpk77     Adaptive k-bit (k=1..12) offset LSB bitstream (78-byte unzx0_adpk_77b.asm)\n"
+        "  --adpk78     Adaptive k-bit (k=1..12) offset LSB bitstream (78-byte unzx0_adpk_78b.asm)\n"
         "  --strd80     1st-order arbitrary 16-bit Stride-Delta post-filter (80-byte unzx0_strd_80b.asm)\n"
         "  --compat82   Zero-overhead ZX0-compatible + Order-1 Stride-Delta (82-byte unzx0_compat_82b.asm)\n"
         "  --strd82     Multi-pass Order-1..5 Stride-Delta post-filter (82-byte unzx0_strd_82b.asm)\n"
         "  --x86e8      Zero-overhead ZX0-compatible + x86 E8 Call-Target filter (84-byte unzx0_x86e8_84b.asm)\n"
         "  --univ93     Universal Zero-overhead ZX0 + Stride-Delta + x86 E8 filter (93-byte unzx0_univ_93b.asm)\n"
-        "  --hybrid108  Multi-Stage Hybrid 2D 0B-Ovh ZX0 + E8/E9 + Free-BX Stride (108-byte unzx0_hybrid_108b.asm)\n"
+        "  --hybrid104  Multi-Stage Hybrid 2D 0B-Ovh ZX0 + E8/E9 + Free-BX Stride (104-byte unzx0_hybrid_104b.asm)\n"
         "  --pro111     Zero-Overhead ZX0 + E8/E9 + 16-Bit/8-Bit 2D Stride (111-byte unzx0_pro_111b.asm)\n"
         "  --ultra128   Flagship Variable-Bit Literals + E8/E9 + 16-Bit/8-Bit 2D Stride (128-byte unzx0_ultra_128b.asm)\n",
         prog, prog, prog
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--zx0") == 0) {
             format = ULTRA_FORMAT_ZX0_V2;
-        } else if (strcmp(argv[i], "--adpk77") == 0) {
+        } else if (strcmp(argv[i], "--adpk77") == 0 || strcmp(argv[i], "--adpk78") == 0) {
             format = ULTRA_FORMAT_ADPK_77B;
         } else if (strcmp(argv[i], "--strd80") == 0) {
             format = ULTRA_FORMAT_STRD_80B;
@@ -229,7 +229,7 @@ int main(int argc, char **argv) {
             format = ULTRA_FORMAT_X86E8_84B;
         } else if (strcmp(argv[i], "--univ93") == 0) {
             format = ULTRA_FORMAT_UNIV_93B;
-        } else if (strcmp(argv[i], "--hybrid108") == 0 || strcmp(argv[i], "--hybrid110") == 0) {
+        } else if (strcmp(argv[i], "--hybrid104") == 0 || strcmp(argv[i], "--hybrid108") == 0 || strcmp(argv[i], "--hybrid110") == 0) {
             format = ULTRA_FORMAT_HYBRID_108B;
         } else if (strcmp(argv[i], "--pro111") == 0) {
             format = ULTRA_FORMAT_PRO_111B;

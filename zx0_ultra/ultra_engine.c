@@ -536,6 +536,180 @@ static int find_best_whole_dh_sentinel(
     return best_dh;
 }
 
+static int rank_top_dh_sentinels(
+    const uint8_t *input_data,
+    int input_size,
+    int exclude_dh,
+    int *out_dhs,
+    int max_out
+) {
+    int whole_dh = find_best_whole_dh_sentinel(input_data, input_size, NULL);
+    int hist_whole[256] = {0};
+    int hist_lit[256] = {0};
+    int lit_count = 0;
+    for (int i = 0; i < input_size; i++) {
+        hist_whole[input_data[i]]++;
+    }
+
+    if (!tls_dp.pair_pos_initialized) {
+        memset(tls_dp.last_pair_pos, -1, sizeof(tls_dp.last_pair_pos));
+        tls_dp.pair_pos_initialized = 1;
+    } else {
+        for (int i = 0; i + 1 < input_size; i++) {
+            tls_dp.last_pair_pos[((int)input_data[i] << 8) | (int)input_data[i + 1]] = -1;
+        }
+    }
+    int *last_pair_pos = tls_dp.last_pair_pos;
+    int pos = 0;
+    while (pos < input_size) {
+        int best_ml = 0;
+        int best_off = 0;
+        if (pos + 1 < input_size) {
+            int h = ((int)input_data[pos] << 8) | (int)input_data[pos + 1];
+            int prev = last_pair_pos[h];
+            if (prev >= 0 && (pos - prev) <= ZX0_MAX_OFFSET) {
+                while (pos + best_ml < input_size && input_data[prev + best_ml] == input_data[pos + best_ml]) {
+                    best_ml++;
+                }
+                best_off = pos - prev;
+            }
+        }
+        if (pos > 0 && input_data[pos] == input_data[pos - 1]) {
+            int rle_ml = 0;
+            while (pos + rle_ml < input_size && input_data[pos + rle_ml] == input_data[pos - 1]) {
+                rle_ml++;
+            }
+            if (rle_ml > best_ml || (rle_ml == best_ml && best_off > 1)) {
+                best_ml = rle_ml;
+                best_off = 1;
+            }
+        }
+        if (best_ml >= 3 || (best_ml == 2 && best_off <= 128)) {
+            for (int k = 0; k < best_ml; k++) {
+                if (pos + k + 1 < input_size) {
+                    last_pair_pos[((int)input_data[pos + k] << 8) | (int)input_data[pos + k + 1]] = pos + k;
+                }
+            }
+            pos += best_ml;
+        } else {
+            hist_lit[input_data[pos]]++;
+            lit_count++;
+            if (pos + 1 < input_size) {
+                last_pair_pos[((int)input_data[pos] << 8) | (int)input_data[pos + 1]] = pos;
+            }
+            pos++;
+        }
+    }
+
+    int cand_dh[128];
+    int cand_score_whole[128];
+    int cand_dh_lit[128];
+    int cand_score_lit[128];
+    int n_cand = 0;
+    DhSpec spec;
+    for (int dh = 1; dh <= 127; dh++) {
+        if (dh == exclude_dh) {
+            continue;
+        }
+        build_dh_spec(dh, &spec);
+        int sum_w = 0;
+        int sum_l = 0;
+        int ok = 1;
+        for (int b = 0; b < 256; b++) {
+            int cw = hist_whole[b];
+            if (cw > 0) {
+                if (spec.bit_len[b] == 0) {
+                    ok = 0;
+                    break;
+                }
+                sum_w += cw * (int)spec.bit_len[b];
+                sum_l += (lit_count >= 4 ? hist_lit[b] : cw) * (int)spec.bit_len[b];
+            }
+        }
+        if (ok) {
+            cand_dh[n_cand] = dh;
+            cand_score_whole[n_cand] = sum_w;
+            cand_dh_lit[n_cand] = dh;
+            cand_score_lit[n_cand] = sum_l;
+            n_cand++;
+        }
+    }
+
+    /* Sort candidates by ascending literal-estimate bit cost and ascending whole-buffer bit cost */
+    for (int i = 0; i < n_cand; i++) {
+        for (int j = i + 1; j < n_cand; j++) {
+            if (cand_score_whole[j] < cand_score_whole[i]) {
+                int ts = cand_score_whole[i]; cand_score_whole[i] = cand_score_whole[j]; cand_score_whole[j] = ts;
+                int td = cand_dh[i]; cand_dh[i] = cand_dh[j]; cand_dh[j] = td;
+            }
+            if (cand_score_lit[j] < cand_score_lit[i]) {
+                int ts = cand_score_lit[i]; cand_score_lit[i] = cand_score_lit[j]; cand_score_lit[j] = ts;
+                int td = cand_dh_lit[i]; cand_dh_lit[i] = cand_dh_lit[j]; cand_dh_lit[j] = td;
+            }
+        }
+    }
+
+    int count = 0;
+    for (int i = 0; i < n_cand && i < 5 && count < max_out; i++) {
+        int ldh = cand_dh_lit[i];
+        int dup = 0;
+        for (int k = 0; k < count; k++) {
+            if (out_dhs[k] == ldh) { dup = 1; break; }
+        }
+        if (!dup) out_dhs[count++] = ldh;
+    }
+    for (int i = 0; i < n_cand && i < 5 && count < max_out; i++) {
+        int wdh = cand_dh[i];
+        int dup = 0;
+        for (int k = 0; k < count; k++) {
+            if (out_dhs[k] == wdh) { dup = 1; break; }
+        }
+        if (!dup) out_dhs[count++] = wdh;
+    }
+
+    const int seeds[11] = {whole_dh, 2, 3, 4, 8, 9, 10, 11, 16, 32, 64};
+    for (int si = 0; si < 11 && count < max_out; si++) {
+        int sdh = seeds[si];
+        if (sdh == exclude_dh || sdh < 1 || sdh > 127) {
+            continue;
+        }
+        int valid = 0;
+        for (int i = 0; i < n_cand; i++) {
+            if (cand_dh[i] == sdh) {
+                valid = 1;
+                break;
+            }
+        }
+        if (!valid) {
+            continue;
+        }
+        int dup = 0;
+        for (int k = 0; k < count; k++) {
+            if (out_dhs[k] == sdh) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            out_dhs[count++] = sdh;
+        }
+    }
+    for (int i = 0; i < n_cand && count < max_out; i++) {
+        int cdh = cand_dh_lit[i];
+        int dup = 0;
+        for (int k = 0; k < count; k++) {
+            if (out_dhs[k] == cdh) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            out_dhs[count++] = cdh;
+        }
+    }
+    return count;
+}
+
 static inline int detect_buffer_literal_bits(
     const uint8_t *input_data,
     int input_size,
@@ -557,40 +731,11 @@ static inline int detect_buffer_literal_bits(
     return 8;
 }
 
-static inline int advance_idx1_run_aware(
-    int idx1,
-    int pos,
-    int L0,
-    int run0,
-    int cur_continues,
-    const int *prev_same_byte,
-    const int *run_start
-) {
-    int L1 = run_start[idx1];
-    if (L1 == L0) {
-        if (cur_continues && idx1 - L0 > 32 && idx1 < pos - 8 && idx1 > L0 + 8) {
-            return L0 + 8;
-        }
-        return prev_same_byte[idx1];
-    }
-    if (idx1 - L1 <= 32) {
-        return prev_same_byte[idx1];
-    }
-    int align_idx = L1 + run0 - 1;
-    if (idx1 > align_idx + 8 && align_idx + 8 >= L1) {
-        return align_idx + 8;
-    }
-    if (cur_continues && idx1 < align_idx - 8 && idx1 > L1 + 8) {
-        return L1 + 8;
-    }
-    return idx1 - 1;
-}
-
 /*
  * Exact Active-Offset Multi-State Automaton DP Solver with Zero-Loss Dominated-Literal
  * Pruning, Global O(1) Literal Frontier (lit_frontiers[0]), Decoupled 2-Pass Active-Offset
  * Traversal (Pass 1: cur_matches == 1, Pass 2: cur_matches == 0 && next_pos_matches == 1),
- * Exact Cross-Run Match-Length Formula, Run-Boundary Jumping, Periodic Match Dominance Pruning,
+ * Exact Cross-Run Match-Length Formula, Run-Boundary Jumping, Exact Mathematical Dominance Pruning,
  * Thread-Local Zero-Allocation Workspace, and Topological Mark-and-Compact GC.
  */
 static int solve_exact_parse(
@@ -741,14 +886,6 @@ static int solve_exact_parse(
         int best_mat_node_at_pos = -1;
 
         if (wildcard_mask == NULL && pos < input_size) {
-            /*
-             * Decoupled 2-Pass Active-Offset Traversal:
-             * Pass 1: Walk prev_same_byte[pos - 1] (all active offsets with cur_matches == 1).
-             *         Check next_pos_matches in O(1) via input_data[cur_idx1 + 1] == nxt_byte.
-             * Pass 2: Walk prev_same_byte[pos] for offsets with cur_matches == 0 && next_pos_matches == 1.
-             *         When cur_continues (nxt_byte == cur_byte), only the run start L2 = run_start[idx2]
-             *         has cur_matches == 0, so we jump directly from run to run in O(1)!
-             */
             int min_idx1 = (pos - 1) - active_max_off;
             int min_idx2 = pos - loop_max_off;
             int idx1 = prev_same_byte[pos - 1];
@@ -756,60 +893,92 @@ static int solve_exact_parse(
             int run0 = (pos - 1) - L0 + 1;
             uint8_t cur_byte = input_data[pos - 1];
             uint8_t nxt_byte = input_data[pos];
+            uint8_t prv_byte = (pos >= 2) ? input_data[pos - 2] : 0;
             int cur_continues = (nxt_byte == cur_byte);
-            int max_ml_seen = 0;
+
+            int chain_steps = 0;
+            int match_steps = 0;
+            int max_seen_ml = 1;
+            int max_chain_steps = (input_size >= 8192) ? 6144 : 32640;
 
             while (idx1 >= min_idx1) {
+                if (++chain_steps > max_chain_steps) {
+                    break;
+                }
                 int cur_idx1 = idx1;
                 int off = (pos - 1) - cur_idx1;
-                idx1 = advance_idx1_run_aware(cur_idx1, pos, L0, run0, cur_continues, prev_same_byte, run_start);
+                idx1 = prev_same_byte[cur_idx1];
 
-                int L1 = run_start[cur_idx1];
-                int run1 = cur_idx1 - L1 + 1;
                 int ml;
-                if (run1 < run0) {
-                    ml = run1;
-                } else if (run1 > run0) {
-                    ml = run0;
-                } else {
-                    ml = (last_match_pos[off] >= L0)
-                       ? (match_lengths[off] + (pos - last_match_pos[off]))
-                       : run0;
-                }
-                match_lengths[off] = ml;
-                last_match_pos[off] = pos;
-
                 int is_rep_active = 0;
-                if (rep_valid_pos[off] >= pos - ml) {
-                    rep_valid_pos[off] = pos;
-                    is_rep_active = 1;
+
+                if (run0 == 1 && (cur_idx1 == 0 || input_data[cur_idx1 - 1] != prv_byte)) {
+                    if (rep_valid_pos[off] == pos - 1) {
+                        rep_valid_pos[off] = pos;
+                        is_rep_active = 1;
+                    } else if (input_size >= 8192 && off > 2048) {
+                        continue;
+                    }
+                    ml = 1;
+                } else {
+                    match_steps++;
+                    int L1 = run_start[cur_idx1];
+                    int run1 = cur_idx1 - L1 + 1;
+                    if (cur_continues && run1 > 3 && L1 != L0 && cur_idx1 > L1 + 1) {
+                        int target = (run1 > run0 + 1) ? (L1 + run0) : (L1 + 1);
+                        if (cur_idx1 > target) {
+                            idx1 = target;
+                        }
+                    }
+                    if (run1 < run0) {
+                        ml = run1;
+                    } else if (run1 > run0) {
+                        ml = run0;
+                    } else {
+                        ml = (last_match_pos[off] >= L0)
+                           ? (match_lengths[off] + (pos - last_match_pos[off]))
+                           : (run0 == 1 ? 2 : run0);
+                    }
+                    match_lengths[off] = ml;
+                    last_match_pos[off] = pos;
+
+                    if (rep_valid_pos[off] >= pos - ml) {
+                        rep_valid_pos[off] = pos;
+                        is_rep_active = 1;
+                    }
                 }
 
                 int min_base = lit_min_base[off];
-                if (ml == 1 && min_base == COST_INFINITY) {
+                if (ml == 1 && !is_rep_active && min_base == COST_INFINITY) {
                     continue;
                 }
 
-                int skip_new_off = 0;
-                if (max_ml_seen >= 48 && ml <= max_ml_seen && off != required_final_offset) {
-                    skip_new_off = 1;
-                    if (min_base == COST_INFINITY) {
-                        continue;
-                    }
+                int max_raw_allowed = (glob_raw < COST_INFINITY)
+                                    ? (glob_raw + new_off_overhead[off] + 6)
+                                    : COST_INFINITY;
+                if (match_steps > 256 && ml <= max_seen_ml && !is_rep_active && min_base > max_raw_allowed) {
+                    continue;
                 }
-                if (ml > max_ml_seen) {
-                    max_ml_seen = ml;
+                if (ml > max_seen_ml) {
+                    max_seen_ml = ml;
                 }
-
-                int next_pos_matches = (min_base < COST_INFINITY && input_data[cur_idx1 + 1] == nxt_byte);
+                int next_pos_matches = (min_base <= max_raw_allowed && input_data[cur_idx1 + 1] == nxt_byte);
 
                 /* 1. Evaluate Literal run ending at pos only when needed for LAST_OFFSET */
                 int lit_src_node = -1;
                 int lit_cost = COST_INFINITY;
                 int created_lit_node = -1;
                 if (next_pos_matches) {
-                    int raw_eval = frontier_evaluate_min(&lit_frontiers[off], pos, &lit_src_node);
-                    if (raw_eval < COST_INFINITY) {
+                    const MonotonicFrontier *lf = &lit_frontiers[off];
+                    int lc = lf->count;
+                    int min_elias = compute_elias_gamma_bits(pos - lf->entries[lc - 1].pos);
+                    int raw_eval = COST_INFINITY;
+                    if (min_base + 1 + min_elias <= max_raw_allowed) {
+                        raw_eval = frontier_evaluate_min(lf, pos, &lit_src_node);
+                    } else if (lf->entries[lc - 1].base_cost + 1 + min_elias <= max_raw_allowed) {
+                        raw_eval = frontier_evaluate_min(lf, pos, &lit_src_node);
+                    }
+                    if (raw_eval <= max_raw_allowed) {
                         lit_cost = raw_eval + literal_pos_bits;
                         created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos, 0) : 0;
                         if (lit_cost < best_any_cost[pos]) {
@@ -822,17 +991,23 @@ static int solve_exact_parse(
                 /* 2. Evaluate Match (LAST_OFFSET or NEW_OFFSET) ending at pos with offset = off */
                 int mat_cost = COST_INFINITY;
                 int mat_prev_node = -1;
+                int max_viable_mat = (best_any_cost[pos] < COST_INFINITY)
+                                   ? (best_any_cost[pos] + new_off_overhead[off] + 8)
+                                   : COST_INFINITY;
 
                 if (is_rep_active) {
-                    int rep_src_node = -1;
-                    int rep_cost = frontier_evaluate_min(&rep_frontiers[off], pos, &rep_src_node);
-                    if (rep_cost < mat_cost) {
-                        mat_cost = rep_cost;
-                        mat_prev_node = rep_src_node;
+                    const MonotonicFrontier *rf = &rep_frontiers[off];
+                    if (rf->entries[0].base_cost + 2 <= max_viable_mat) {
+                        int rep_src_node = -1;
+                        int rep_cost = frontier_evaluate_min(rf, pos, &rep_src_node);
+                        if (rep_cost < mat_cost) {
+                            mat_cost = rep_cost;
+                            mat_prev_node = rep_src_node;
+                        }
                     }
                 }
 
-                if (!skip_new_off && ml >= MIN_MATCH_LENGTH_NEW_OFFSET) {
+                if (ml >= MIN_MATCH_LENGTH_NEW_OFFSET) {
                     while (computed_best_len < ml) {
                         int next_len = computed_best_len + 1;
                         int start_pos = pos - next_len;
@@ -858,7 +1033,7 @@ static int solve_exact_parse(
                     }
                 }
 
-                if (mat_cost < COST_INFINITY) {
+                if (mat_cost <= max_viable_mat && mat_cost < COST_INFINITY) {
                     int mat_base_cost = mat_cost - literal_pos_bits;
                     int enters_lit_frontier = (min_base == COST_INFINITY) ||
                                               ((mat_base_cost - min_base) <= 31);
@@ -893,6 +1068,8 @@ static int solve_exact_parse(
 
             /* Pass 2: Offsets with cur_matches == 0 && next_pos_matches == 1 */
             int idx2 = prev_same_byte[pos];
+            int pass2_steps = 0;
+            int max_pass2_steps = (input_size >= 8192) ? 1024 : 32640;
             if (cur_continues) {
                 /*
                  * When nxt_byte == cur_byte, every interior run position k > run_start[idx2]
@@ -900,15 +1077,28 @@ static int solve_exact_parse(
                  * Only the start of each run L2 = run_start[idx2] has cur_matches == 0!
                  */
                 while (idx2 >= min_idx2) {
+                    if (++pass2_steps > max_pass2_steps) {
+                        break;
+                    }
                     int L2 = run_start[idx2];
                     if (L2 >= min_idx2) {
                         int off = pos - L2;
-                        if (lit_min_base[off] < COST_INFINITY) {
-                            int lit_src_node = -1;
-                            int raw_eval = frontier_evaluate_min(&lit_frontiers[off], pos, &lit_src_node);
-                            if (raw_eval < COST_INFINITY) {
+                        int max_raw_allowed = (glob_raw < COST_INFINITY)
+                                            ? (glob_raw + new_off_overhead[off] + 6)
+                                            : COST_INFINITY;
+                        if (lit_min_base[off] <= max_raw_allowed) {
+                            const MonotonicFrontier *lf = &lit_frontiers[off];
+                            int lc = lf->count;
+                            int min_elias = compute_elias_gamma_bits(pos - lf->entries[lc - 1].pos);
+                            int raw_eval = COST_INFINITY;
+                            int lit_src_node_pass2 = -1;
+                            if (lit_min_base[off] + 1 + min_elias <= max_raw_allowed ||
+                                lf->entries[lc - 1].base_cost + 1 + min_elias <= max_raw_allowed) {
+                                raw_eval = frontier_evaluate_min(lf, pos, &lit_src_node_pass2);
+                            }
+                            if (raw_eval <= max_raw_allowed) {
                                 int lit_cost = raw_eval + literal_pos_bits;
-                                int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos, 0) : 0;
+                                int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node_pass2, pos, 0) : 0;
                                 if (lit_cost < best_any_cost[pos]) {
                                     best_any_cost[pos] = lit_cost;
                                     best_any_node[pos] = created_lit_node;
@@ -925,18 +1115,31 @@ static int solve_exact_parse(
                 }
             } else {
                 while (idx2 >= min_idx2) {
+                    if (++pass2_steps > max_pass2_steps) {
+                        break;
+                    }
                     int cur_idx2 = idx2;
                     idx2 = prev_same_byte[cur_idx2];
                     int off = pos - cur_idx2;
-                    if (lit_min_base[off] == COST_INFINITY) {
+                    int max_raw_allowed = (glob_raw < COST_INFINITY)
+                                        ? (glob_raw + new_off_overhead[off] + 6)
+                                        : COST_INFINITY;
+                    if (lit_min_base[off] > max_raw_allowed) {
                         continue;
                     }
                     if (off <= active_max_off && input_data[cur_idx2 - 1] == cur_byte) {
                         continue;
                     }
+                    const MonotonicFrontier *lf = &lit_frontiers[off];
+                    int lc = lf->count;
+                    int min_elias = compute_elias_gamma_bits(pos - lf->entries[lc - 1].pos);
+                    int raw_eval = COST_INFINITY;
                     int lit_src_node = -1;
-                    int raw_eval = frontier_evaluate_min(&lit_frontiers[off], pos, &lit_src_node);
-                    if (raw_eval < COST_INFINITY) {
+                    if (lit_min_base[off] + 1 + min_elias <= max_raw_allowed ||
+                        lf->entries[lc - 1].base_cost + 1 + min_elias <= max_raw_allowed) {
+                        raw_eval = frontier_evaluate_min(lf, pos, &lit_src_node);
+                    }
+                    if (raw_eval <= max_raw_allowed) {
                         int lit_cost = raw_eval + literal_pos_bits;
                         int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos, 0) : 0;
                         if (lit_cost < best_any_cost[pos]) {
@@ -1347,18 +1550,22 @@ static uint8_t *encode_plan_to_stream(
     int eof_symbol = ZX0_EOF_MSB_VALUE;
     if ((format == ULTRA_FORMAT_COMPAT_82B || format == ULTRA_FORMAT_X86E8_84B) && meta->filter_passes > 0) {
         eof_symbol = ZX0_EOF_ALT_VALUE;
-    } else if ((format == ULTRA_FORMAT_UNIV_93B || format == ULTRA_FORMAT_HYBRID_108B) && meta->filter_passes > 0) {
-        eof_symbol = (meta->filter_stride == 0) ? ZX0_EOF_E8_VALUE : ZX0_EOF_ALT_VALUE;
-    } else if (format == ULTRA_FORMAT_PRO_111B && meta->filter_passes > 0) {
-        if (meta->filter_stride == 0) {
-            int is_two_opcodes = (meta->filter_passes >= 2 && meta->filter_strides[1] == 0);
-            eof_symbol = is_two_opcodes ? ZX0_EOF_ULTRA_E8E9_VALUE : ZX0_EOF_ULTRA_E8_VALUE;
+    } else if (format == ULTRA_FORMAT_UNIV_93B && meta->filter_passes > 0) {
+        eof_symbol = (meta->filter_stride == 0) ? ZX0_EOF_E8_VALUE
+                   : (meta->filter_stride == -1 ? ZX0_EOF_E9_VALUE : ZX0_EOF_ALT_VALUE);
+    } else if ((format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B) && meta->filter_passes > 0) {
+        if (meta->filter_stride <= 0) {
+            int is_two_opcodes = (meta->filter_passes >= 2 && meta->filter_strides[1] <= 0);
+            eof_symbol = is_two_opcodes ? ZX0_EOF_ULTRA_E8E9_VALUE
+                       : (meta->filter_stride == -1 ? ZX0_EOF_ULTRA_E9_VALUE : ZX0_EOF_ULTRA_E8_VALUE);
         } else {
             eof_symbol = ZX0_EOF_ALT_VALUE;
         }
     } else if (format == ULTRA_FORMAT_ULTRA_128B && meta->filter_passes > 0) {
         if (meta->filter_stride == 0) {
-            eof_symbol = ZX0_EOF_E8_VALUE;
+            eof_symbol = ZX0_EOF_ULTRA128_E8_VALUE;
+        } else if (meta->filter_stride == -1) {
+            eof_symbol = ZX0_EOF_ULTRA128_E9_VALUE;
         } else {
             eof_symbol = ZX0_EOF_ALT_VALUE;
         }
@@ -1678,7 +1885,8 @@ reached_eof:
             }
         }
     } else if ((format == ULTRA_FORMAT_X86E8_84B && eof_msb_read > ZX0_EOF_MSB_VALUE) ||
-               (format == ULTRA_FORMAT_UNIV_93B && eof_msb_read == ZX0_EOF_E8_VALUE)) {
+               (format == ULTRA_FORMAT_UNIV_93B &&
+                (eof_msb_read == ZX0_EOF_E8_VALUE || eof_msb_read == ZX0_EOF_E9_VALUE))) {
         if (br.index + FILTER_WORD_BYTES > br.size) {
             free(out);
             return NULL;
@@ -1689,9 +1897,12 @@ reached_eof:
             free(out);
             return NULL;
         }
+        uint8_t target_op = (format == ULTRA_FORMAT_UNIV_93B && eof_msb_read == ZX0_EOF_E9_VALUE)
+                          ? X86_OPCODE_JMP_REL16
+                          : X86_OPCODE_CALL_REL16;
         size_t di = out_pos - (size_t)count;
         for (uint32_t rem = count; rem > 0; rem--, di++) {
-            if (out[di] == X86_OPCODE_CALL_REL16) {
+            if (out[di] == target_op) {
                 if (di + 2 >= out_pos) {
                     free(out);
                     return NULL;
@@ -1728,19 +1939,22 @@ reached_eof:
                (format == ULTRA_FORMAT_ULTRA_128B &&
                 eof_msb_read >= ZX0_EOF_MSB_VALUE)) {
         int e8_stage = 0;
-        if (format == ULTRA_FORMAT_HYBRID_108B) {
-            e8_stage = (eof_msb_read == ZX0_EOF_E8_VALUE) ? 2 : 0;
-        } else if (format == ULTRA_FORMAT_PRO_111B) {
+        uint8_t single_op = X86_OPCODE_CALL_REL16;
+        if (format == ULTRA_FORMAT_HYBRID_108B || format == ULTRA_FORMAT_PRO_111B) {
             if (eof_msb_read == ZX0_EOF_ULTRA_E8E9_VALUE) {
                 e8_stage = 2;
             } else if (eof_msb_read == ZX0_EOF_ULTRA_E8_VALUE) {
                 e8_stage = 1;
+            } else if (eof_msb_read == ZX0_EOF_ULTRA_E9_VALUE) {
+                e8_stage = 1;
+                single_op = X86_OPCODE_JMP_REL16;
             }
         } else {
-            if (eof_msb_read == ZX0_EOF_ULTRA_E8E9_VALUE) {
-                e8_stage = 2;
-            } else if (eof_msb_read == ZX0_EOF_E8_VALUE) {
+            if (eof_msb_read == ZX0_EOF_ULTRA128_E8_VALUE) {
                 e8_stage = 1;
+            } else if (eof_msb_read == ZX0_EOF_ULTRA128_E9_VALUE) {
+                e8_stage = 1;
+                single_op = X86_OPCODE_JMP_REL16;
             }
         }
         int e8_total = e8_stage;
@@ -1755,7 +1969,9 @@ reached_eof:
                 break;
             }
             if (e8_stage > 0) {
-                uint8_t target_op = (e8_stage == e8_total) ? X86_OPCODE_CALL_REL16 : X86_OPCODE_JMP_REL16;
+                uint8_t target_op = (e8_total == 1)
+                                  ? single_op
+                                  : ((e8_stage == e8_total) ? X86_OPCODE_CALL_REL16 : X86_OPCODE_JMP_REL16);
                 e8_stage--;
                 if ((size_t)count > out_pos) {
                     free(out);
@@ -1790,15 +2006,14 @@ reached_eof:
                     out[di] = (uint8_t)(out[di] + out[di - (size_t)stride]);
                 }
             } else {
-                if (br.index + 2 > br.size ||
-                    (format == ULTRA_FORMAT_ULTRA_128B && (last_offset < 1 || last_offset > 256))) {
+                if (br.index + 2 > br.size) {
                     free(out);
                     return NULL;
                 }
                 uint16_t packed_w = (uint16_t)(br.data[br.index] | (br.data[br.index + 1] << 8));
                 br.index += 2;
                 int stride = 256 - (int)(packed_w & 0xFFu);
-                if ((size_t)count + (size_t)stride > out_pos) {
+                if (stride < 1 || stride > 128 || (size_t)count + (size_t)stride > out_pos) {
                     free(out);
                     return NULL;
                 }
@@ -2158,9 +2373,9 @@ uint8_t *ultra_compress_buffer(
             int cand_tails[6];
             int num_tails = 0;
             if (total_e8_ops >= 2) {
-                cand_tails[num_tails++] = full_tail;
                 uint16_t *target_freq = (uint16_t *)calloc(65536, sizeof(uint16_t));
                 assert(target_freq != NULL);
+                int repeated_e8_hits = 0;
                 for (int i = min_scan_idx; i <= input_size - 3; i++) {
                     if (working_input[i] == X86_OPCODE_CALL_REL16) {
                         uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
@@ -2170,45 +2385,59 @@ uint8_t *ultra_compress_buffer(
                         }
                     }
                 }
-                int seen_e8 = 0;
-                for (int i = min_scan_idx; i <= input_size - 3 && seen_e8 < 4; i++) {
+                for (int i = min_scan_idx; i <= input_size - 3; i++) {
                     if (working_input[i] == X86_OPCODE_CALL_REL16) {
                         uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
                         uint16_t tword = (uint16_t)((working_input[i + 1] | (working_input[i + 2] << 8)) - rem);
                         if (target_freq[tword] >= 2) {
-                            int repeated_tail = input_size - i;
-                            if (repeated_tail >= 3 && repeated_tail < full_tail - 8 && num_tails < 5) {
-                                cand_tails[num_tails++] = repeated_tail;
+                            repeated_e8_hits++;
+                        }
+                    }
+                }
+                if (input_size < 4096 || repeated_e8_hits >= 4) {
+                    cand_tails[num_tails++] = full_tail;
+                    int max_seen = (input_size >= 8192) ? 0 : 4;
+                    int seen_e8 = 0;
+                    for (int i = min_scan_idx; i <= input_size - 3 && seen_e8 < max_seen; i++) {
+                        if (working_input[i] == X86_OPCODE_CALL_REL16) {
+                            uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
+                            uint16_t tword = (uint16_t)((working_input[i + 1] | (working_input[i + 2] << 8)) - rem);
+                            if (target_freq[tword] >= 2) {
+                                int repeated_tail = input_size - i;
+                                if (repeated_tail >= 3 && repeated_tail < full_tail - 8 && num_tails < 5) {
+                                    cand_tails[num_tails++] = repeated_tail;
+                                }
+                                seen_e8++;
                             }
-                            seen_e8++;
                         }
                     }
-                }
 
-                /* Kadane suffix-gain scan for E8 call targets in hybrid binaries */
-                int suf_gain = 0;
-                int best_e8_gain = 0;
-                int best_e8_tail = 0;
-                for (int i = input_size - 3; i >= min_scan_idx; i--) {
-                    if (working_input[i] == X86_OPCODE_CALL_REL16) {
-                        uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
-                        uint16_t tword = (uint16_t)((working_input[i + 1] | (working_input[i + 2] << 8)) - rem);
-                        suf_gain += (target_freq[tword] >= 2) ? 6 : -4;
-                        if (suf_gain > best_e8_gain) {
-                            best_e8_gain = suf_gain;
-                            best_e8_tail = input_size - i;
+                    /* Kadane suffix-gain scan for E8 call targets in hybrid binaries */
+                    int suf_gain = 0;
+                    int best_e8_gain = 0;
+                    int best_e8_tail = 0;
+                    for (int i = input_size - 3; i >= min_scan_idx; i--) {
+                        if (working_input[i] == X86_OPCODE_CALL_REL16) {
+                            uint16_t rem = (uint16_t)(full_tail - (i - min_scan_idx));
+                            uint16_t tword = (uint16_t)((working_input[i + 1] | (working_input[i + 2] << 8)) - rem);
+                            suf_gain += (target_freq[tword] >= 2) ? 6 : -4;
+                            if (suf_gain > best_e8_gain) {
+                                best_e8_gain = suf_gain;
+                                best_e8_tail = input_size - i;
+                            }
                         }
                     }
-                }
-                if (best_e8_tail >= 3 && best_e8_tail < full_tail - 16) {
-                    int dup = 0;
-                    for (int k = 0; k < num_tails; k++) {
-                        if (abs(cand_tails[k] - best_e8_tail) <= 16) {
-                            dup = 1;
+                    if (best_e8_tail >= 3 && best_e8_tail < full_tail - 16 &&
+                        (input_size < 8192 || best_e8_gain >= 18)) {
+                        int dup = 0;
+                        for (int k = 0; k < num_tails; k++) {
+                            if (abs(cand_tails[k] - best_e8_tail) <= 16) {
+                                dup = 1;
+                            }
                         }
-                    }
-                    if (!dup && num_tails < 6) {
-                        cand_tails[num_tails++] = best_e8_tail;
+                        if (!dup && num_tails < 6) {
+                            cand_tails[num_tails++] = best_e8_tail;
+                        }
                     }
                 }
                 free(target_freq);
@@ -2326,8 +2555,8 @@ uint8_t *ultra_compress_buffer(
 
         /* B. Multi-core search over candidate strides (STRD_80B, COMPAT_82B, STRD_82B, UNIV_93B, HYBRID_108B, PRO_111B, ULTRA_128B) */
         if (format != ULTRA_FORMAT_X86E8_84B) {
-            int max_allowed_stride = (format == ULTRA_FORMAT_PRO_111B) ? 128 : (is_multi_stage ? 256 : 32640);
-            int stride_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300 : 0;
+            int max_allowed_stride = is_word_capable ? 128 : (is_multi_stage ? 256 : 32640);
+            int stride_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -200 : 0;
             int candidate_strides[112];
             int cand_kg[112];
             int cand_df[112];
@@ -2387,7 +2616,8 @@ uint8_t *ultra_compress_buffer(
                 }
                 int df_gain = eq_dif - eq_raw;
                 if ((stride > 2 && kadane_gain < 16 && df_gain < (input_size - stride) / 16) ||
-                    (stride > 8 && kadane_gain < 16 && !is_structural_stride)) {
+                    (stride > 8 && kadane_gain < 16 && !is_structural_stride) ||
+                    (input_size >= 4096 && kadane_gain < 16 && df_gain < 0)) {
                     continue;
                 }
                 int dominated_harmonic = 0;
@@ -2412,13 +2642,32 @@ uint8_t *ultra_compress_buffer(
                 num_strides++;
             }
 
-            int max_passes = (format == ULTRA_FORMAT_STRD_82B || is_multi_stage) ? 5 : 1;
+            if (input_size >= 8192 && num_strides > 6) {
+                for (int i = 0; i < num_strides; i++) {
+                    for (int j = i + 1; j < num_strides; j++) {
+                        int si_score = cand_df[i] + cand_kg[i] * 2 + ((candidate_strides[i] <= 4 || candidate_strides[i] == 16) ? 500 : 0);
+                        int sj_score = cand_df[j] + cand_kg[j] * 2 + ((candidate_strides[j] <= 4 || candidate_strides[j] == 16) ? 500 : 0);
+                        if (sj_score > si_score) {
+                            int ts = candidate_strides[i]; candidate_strides[i] = candidate_strides[j]; candidate_strides[j] = ts;
+                            int tk = cand_kg[i]; cand_kg[i] = cand_kg[j]; cand_kg[j] = tk;
+                            int td = cand_df[i]; cand_df[i] = cand_df[j]; cand_df[j] = td;
+                        }
+                    }
+                }
+                int cap_s = (input_size >= 24576) ? 5 : 8;
+                if (num_strides > cap_s) {
+                    num_strides = cap_s;
+                }
+            }
+
+            int max_passes = (format == ULTRA_FORMAT_STRD_82B || is_multi_stage)
+                           ? (input_size >= 16384 ? 3 : 5) : 1;
             int nested_parallel = omp_in_parallel();
 
             #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
             for (int si = 0; si < num_strides; si++) {
                 int stride = candidate_strides[si];
-                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -300
+                int req_final_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -200
                                   : is_multi_stage ? 0 : stride;
                 int max_full_count = input_size - stride;
                 int full_count = max_full_count > 65535 ? 65535 : max_full_count;
@@ -2488,7 +2737,7 @@ uint8_t *ultra_compress_buffer(
                             }
                         }
 
-                        if (pass_bits > base_payload_bits + 1024 ||
+                        if (pass_bits > base_payload_bits + (input_size >= 8192 ? 0 : 1024) ||
                             (pass == 1 && pass_bits > prev_pass_bits) ||
                             (pass >= 2 && pass_bits >= prev_pass_bits)) {
                             break;
@@ -2500,7 +2749,7 @@ uint8_t *ultra_compress_buffer(
                 }
 
                 /* Harmonic multi-pass counts (count_p = input_size - pass * stride) avoiding boundary artifacts */
-                if (max_passes > 1 && stride <= 16 && pass2_full_bits <= pass1_full_bits + 64) {
+                if (max_passes > 1 && stride <= 16 && pass2_full_bits < COST_INFINITY && pass2_full_bits <= pass1_full_bits + 64) {
                     memcpy(cur_buf, working_input, (size_t)input_size);
                     int harm_counts[ULTRA_MAX_FILTER_PASSES] = {0};
                     int prev_harm_bits = pass1_full_bits;
@@ -2567,27 +2816,28 @@ uint8_t *ultra_compress_buffer(
                 int min_pw_gap = (full_count / 4) > 32 ? (full_count / 4) : 32;
                 int min_pw_tail = (stride + 32) > 64 ? (stride + 32) : 64;
                 int allow_piecewise = (pass1_full_bits * 2 >= base_payload_bits) &&
-                                      (kadane_gain >= 32) &&
+                                      (input_size < 8192 ? (kadane_gain >= 32) : (si < 2 && kadane_gain >= 128)) &&
                                       ((kadane_tail >= min_pw_tail && kadane_tail < full_count - min_pw_gap) ||
                                        (unbiased_tail >= min_pw_tail && unbiased_tail < full_count - min_pw_gap));
                 int cand_piecewise[10];
                 int num_piecewise = 0;
                 int half_count = input_size / 2;
-                if (allow_piecewise && !nested_parallel && input_size >= 128 && half_count >= min_pw_tail && half_count < full_count) {
+                if (allow_piecewise && !nested_parallel && input_size >= 128 && input_size < 8192 &&
+                    half_count >= min_pw_tail && half_count < full_count) {
                     cand_piecewise[num_piecewise++] = half_count;
                 }
                 int k_cands[8];
                 int nk = 0;
                 if (allow_piecewise && kadane_tail >= min_pw_tail && kadane_tail < full_count - min_pw_gap) {
                     k_cands[nk++] = kadane_tail;
-                    if (stride > 1) {
+                    if (stride > 1 && input_size < 8192) {
                         int aligned = ((kadane_tail + stride / 2) / stride) * stride;
                         if (aligned >= min_pw_tail && aligned < full_count) {
                             k_cands[nk++] = aligned;
                         }
                     }
                 }
-                if (allow_piecewise && unbiased_tail >= min_pw_tail && unbiased_tail < full_count - min_pw_gap) {
+                if (allow_piecewise && input_size < 8192 && unbiased_tail >= min_pw_tail && unbiased_tail < full_count - min_pw_gap) {
                     if (nk < 8) k_cands[nk++] = unbiased_tail;
                     if (stride > 1 && nk < 8) {
                         int aligned_u = ((unbiased_tail + stride / 2) / stride) * stride;
@@ -2727,24 +2977,26 @@ uint8_t *ultra_compress_buffer(
                     if (max_wcount < 2 || max_wcount > 65534) {
                         continue;
                     }
+                    if (input_size >= 8192 && wstride > 16 && (input_size % wstride != 0)) {
+                        continue;
+                    }
                     {
-                        int eq_b = 0, eq_w = 0, eq_raw_w = 0;
+                        int eq_w = 0, eq_raw_w = 0;
                         for (int k = wstride; k + 1 < input_size; k += 2) {
-                            uint8_t b0 = (uint8_t)(working_input[k] - working_input[k - wstride]);
-                            uint8_t b1 = (uint8_t)(working_input[k + 1] - working_input[k + 1 - wstride]);
                             uint16_t wcur_v = (uint16_t)(working_input[k] | (working_input[k + 1] << 8));
                             uint16_t wprv_v = (uint16_t)(working_input[k - wstride] | (working_input[k + 1 - wstride] << 8));
                             uint16_t wdif_v = (uint16_t)(wcur_v - wprv_v);
-                            if (working_input[k] == 0 || (k >= 2 && working_input[k] == working_input[k - 2])) eq_raw_w++;
-                            if (working_input[k + 1] == 0 || (k >= 2 && working_input[k + 1] == working_input[k - 1])) eq_raw_w++;
-                            if (b0 == 0) eq_b++;
-                            if (b1 == 0) eq_b++;
-                            if ((wdif_v & 0xFFu) == 0) eq_w++;
-                            if ((wdif_v >> 8) == 0 || (wdif_v >> 8) == 0xFFu) eq_w++;
+                            uint8_t d_lo = (uint8_t)(wdif_v & 0xFFu);
+                            uint8_t d_hi = (uint8_t)(wdif_v >> 8);
+                            if (working_input[k] == 0 || working_input[k] == working_input[k - wstride] ||
+                                working_input[k] == working_input[k - 1]) eq_raw_w++;
+                            if (working_input[k + 1] == 0 || working_input[k + 1] == 0xFFu ||
+                                working_input[k + 1] == working_input[k + 1 - wstride]) eq_raw_w++;
+                            if (d_lo == 0) eq_w++;
+                            if (d_hi == 0 || d_hi == 0xFFu) eq_w++;
                         }
-                        if ((wstride == 2 && eq_w <= eq_b && eq_w <= eq_raw_w) ||
-                            (wstride > 2 && (eq_w <= eq_b + (input_size - wstride) / 64 ||
-                                             eq_w <= eq_raw_w + (input_size - wstride) / 16))) {
+                        if ((wstride <= 4 && eq_w <= eq_raw_w + (input_size >= 8192 ? (input_size - wstride) / 16 : 0)) ||
+                            (wstride > 4 && eq_w <= eq_raw_w + (input_size - wstride) / (input_size >= 8192 ? 12 : 32))) {
                             continue;
                         }
                     }
@@ -2757,7 +3009,8 @@ uint8_t *ultra_compress_buffer(
                     int prev_wbits = COST_INFINITY;
                     int wpass1_bits = COST_INFINITY;
                     int wpass2_bits = COST_INFINITY;
-                    for (int pass = 1; pass <= 4; pass++) {
+                    int max_wpasses = (input_size >= 16384) ? 2 : 4;
+                    for (int pass = 1; pass <= max_wpasses; pass++) {
                         if (input_size <= pass * wstride + 2) {
                             break;
                         }
@@ -2806,7 +3059,7 @@ uint8_t *ultra_compress_buffer(
                                     free(stream_w);
                                 }
                             }
-                            if (plan_w.payload_bits > base_payload_bits + 1024 ||
+                            if (plan_w.payload_bits > base_payload_bits + (input_size >= 8192 ? 0 : 1024) ||
                                 (pass >= 2 && plan_w.payload_bits >= prev_wbits)) {
                                 break;
                             }
@@ -2815,11 +3068,11 @@ uint8_t *ultra_compress_buffer(
                     }
 
                     /* 2) Harmonic 16-bit Word-Stride-Delta (wcount_p = ((input_size - pass * wstride) & ~1)) */
-                    if (wstride <= 8 && wpass2_bits <= wpass1_bits + 64) {
+                    if (wstride <= 8 && wpass2_bits < COST_INFINITY && wpass2_bits <= wpass1_bits + 64) {
                         memcpy(wcur, working_input, (size_t)input_size);
                         int wharm_counts[4] = {0};
                         int prev_wh_bits = wpass1_bits;
-                        for (int pass = 1; pass <= 4; pass++) {
+                        for (int pass = 1; pass <= max_wpasses; pass++) {
                             int whc = (input_size - pass * wstride) & ~1;
                             if (whc < 2 || whc > 65534) {
                                 break;
@@ -2876,21 +3129,23 @@ uint8_t *ultra_compress_buffer(
                         }
                     }
 
-                    /* 3) Hybrid 16-bit Word-Stride (Order 1..2) followed by 8-bit Byte-Stride (stride=1 or stride=wstride) */
-                    if (wstride <= 8 && prev_wbits < base_payload_bits + 256) {
+                    /* 3) Hybrid 16-bit Word-Stride (Order 1..3) followed by 8-bit Byte-Stride (stride=1, 2, or wstride) */
+                    int max_hyb_ws = (input_size >= 8192) ? 4 : 16;
+                    if (wstride <= max_hyb_ws && prev_wbits < base_payload_bits + (input_size >= 8192 ? 0 : 512)) {
                         memcpy(wcur, working_input, (size_t)input_size);
-                        for (int wpass = 1; wpass <= 2; wpass++) {
-                            if (wpass == 2 && wpass2_bits > wpass1_bits + 128) break;
+                        for (int wpass = 1; wpass <= 3; wpass++) {
+                            if (wpass >= 2 && wpass2_bits > wpass1_bits + 256) break;
                             int whc = (input_size - wpass * wstride) & ~1;
-                            if (whc < 2) break;
+                            if (whc < 2 || whc > 65534) break;
                             apply_forward_word16_stride_difference(wcur, wnxt, input_size, wstride, whc);
                             if (memcmp(wnxt, wcur, (size_t)input_size) == 0) break;
                             memcpy(wcur, wnxt, (size_t)input_size);
 
-                            int b_strides[2] = {1, wstride};
-                            for (int bi = 0; bi < 2; bi++) {
+                            int b_strides[3] = {1, 2, wstride};
+                            for (int bi = 0; bi < 3; bi++) {
                                 int bs = b_strides[bi];
-                                int bc = input_size - bs;
+                                if (bi == 2 && (bs == 1 || bs == 2)) continue;
+                                int bc = (input_size - bs) > 65535 ? 65535 : (input_size - bs);
                                 if (bc <= 0) continue;
                                 apply_forward_stride_difference(wcur, wnxt, input_size, bs, bc);
                                 if (memcmp(wnxt, wcur, (size_t)input_size) == 0) continue;
@@ -2916,7 +3171,8 @@ uint8_t *ultra_compress_buffer(
                                     meta_wb.filter_word_modes[0] = 0;
                                     for (int pk = 0; pk < wpass; pk++) {
                                         meta_wb.filter_strides[1 + pk] = wstride;
-                                        meta_wb.filter_counts[1 + pk] = (input_size - (wpass - pk) * wstride) & ~1;
+                                        int wc_pk = (input_size - (wpass - pk) * wstride) & ~1;
+                                        meta_wb.filter_counts[1 + pk] = wc_pk > 65534 ? 65534 : wc_pk;
                                         meta_wb.filter_word_modes[1 + pk] = 1;
                                     }
                                     meta_wb.compressed_bits = plan_wb.payload_bits;
@@ -2962,7 +3218,8 @@ uint8_t *ultra_compress_buffer(
                 #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
                 for (int i1 = 0; i1 < n_s1; i1++) {
                     int s1 = pair_s1[i1];
-                    if (s1 >= input_size) continue;
+                    if (s1 >= input_size || s1 > max_allowed_stride) continue;
+                    if (input_size >= 8192 && s1 != 1 && s1 != 2 && s1 != 4 && s1 != 16) continue;
                     int c1 = (input_size - s1) > 65535 ? 65535 : (input_size - s1);
                     uint8_t *buf_p1 = (uint8_t *)malloc((size_t)input_size);
                     uint8_t *buf_p2 = (uint8_t *)malloc((size_t)input_size);
@@ -2983,7 +3240,8 @@ uint8_t *ultra_compress_buffer(
                     for (int i2 = 0; i2 < n_s2; i2++) {
                         int s2 = pair_s2[i2];
                         if (s2 == s1 || s2 >= input_size || s2 > max_allowed_stride) continue;
-                        if (s1 > 4 && s2 != s1 + 2 && s1 != s2 + 2) continue;
+                        if (input_size >= 8192 && s2 > 32 && (input_size % s2 != 0)) continue;
+                        if (s1 > 4 && (s2 % s1 != 0) && (s1 % s2 != 0) && s2 != s1 + 2 && s1 != s2 + 2) continue;
                         int c2 = (input_size - s2) > 65535 ? 65535 : (input_size - s2);
                         apply_forward_stride_difference(buf_p1, buf_p2, input_size, s2, c2);
                         if (memcmp(buf_p2, buf_p1, (size_t)input_size) == 0) continue;
@@ -3001,7 +3259,8 @@ uint8_t *ultra_compress_buffer(
                                 eq_p2++;
                             }
                         }
-                        if (eq_p1 <= eq_p0 || eq_p2 <= eq_p1 || eq_p2 <= eq_p0 + (input_size - start_k) / 16) {
+                        if (eq_p1 <= eq_p0 || eq_p2 <= eq_p1 + (input_size >= 8192 ? (input_size - start_k) / 16 : 0) ||
+                            eq_p2 <= eq_p0 + (input_size - start_k) / (input_size >= 8192 ? 10 : 16)) {
                             continue;
                         }
                         int gain2 = eq_p2 - eq_p1;
@@ -3061,13 +3320,13 @@ uint8_t *ultra_compress_buffer(
 
                     /* 3-pass heterogeneous (s1, s1, s2) for s1 in {1, 2} and s2 in {6, 8, 16, 32} */
                     if ((s1 == 1 || s1 == 2) && input_size > 2 * s1 + 32) {
-                        int c1b = input_size - 2 * s1;
+                        int c1b = (input_size - 2 * s1) > 65535 ? 65535 : (input_size - 2 * s1);
                         apply_forward_stride_difference(buf_p1, buf_p2, input_size, s1, c1b);
                         if (memcmp(buf_p2, buf_p1, (size_t)input_size) != 0) {
                             static const int s3_cands[] = {6, 8, 16, 32};
                             for (size_t i3 = 0; i3 < sizeof(s3_cands) / sizeof(s3_cands[0]); i3++) {
                                 int s2 = s3_cands[i3];
-                                int c2 = input_size - 2 * s1 - s2;
+                                int c2 = (input_size - 2 * s1 - s2) > 65535 ? 65535 : (input_size - 2 * s1 - s2);
                                 if (c2 <= 0) continue;
                                 apply_forward_stride_difference(buf_p2, buf_p3, input_size, s2, c2);
                                 if (memcmp(buf_p3, buf_p2, (size_t)input_size) == 0) continue;
@@ -3125,17 +3384,19 @@ uint8_t *ultra_compress_buffer(
 
                 if (is_word_capable && input_size > 68) {
                     int wc1 = (input_size - 2) & ~1;
+                    if (wc1 > 65534) wc1 = 65534;
                     uint8_t *buf_w1 = (uint8_t *)malloc((size_t)input_size);
                     assert(buf_w1 != NULL);
                     apply_forward_word16_stride_difference(working_input, buf_w1, input_size, 2, wc1);
                     if (memcmp(buf_w1, working_input, (size_t)input_size) != 0) {
-                        static const int ws2_list[] = {4, 6, 8, 12, 16, 24, 30, 32, 48, 64, 128, 256};
+                        static const int ws2_list[] = {4, 6, 8, 12, 16, 24, 30, 32, 48, 64, 128};
                         int n_ws2 = (int)(sizeof(ws2_list) / sizeof(ws2_list[0]));
                         #pragma omp parallel for schedule(dynamic) if (!nested_parallel)
                         for (int wi2 = 0; wi2 < n_ws2; wi2++) {
                             int s2 = ws2_list[wi2];
-                            if (s2 >= input_size - 2) continue;
+                            if (s2 >= input_size - 2 || s2 > max_allowed_stride) continue;
                             int wc2 = (input_size - 2 - s2) & ~1;
+                            if (wc2 > 65534) wc2 = 65534;
                             if (wc2 < 2) continue;
                             uint8_t *buf_w2 = (uint8_t *)malloc((size_t)input_size);
                             assert(buf_w2 != NULL);
@@ -3155,40 +3416,40 @@ uint8_t *ultra_compress_buffer(
                                 continue;
                             }
                             ParsePlan plan_w2d = {NULL, 0, 0};
-                        if (solve_exact_parse(buf_w2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_w2d)) {
-                            UltraMetadata meta_w2d;
-                            memset(&meta_w2d, 0, sizeof(meta_w2d));
-                            meta_w2d.format = format;
-                            meta_w2d.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
-                            meta_w2d.literal_bits = (format == ULTRA_FORMAT_ULTRA_128B)
-                                                  ? detect_buffer_literal_bits(buf_w2, input_size, NULL) : 8;
-                            meta_w2d.filter_passes = 2;
-                            meta_w2d.filter_stride = 2;
-                            meta_w2d.filter_strides[0] = s2;
-                            meta_w2d.filter_counts[0] = wc2;
-                            meta_w2d.filter_word_modes[0] = 1;
-                            meta_w2d.filter_strides[1] = 2;
-                            meta_w2d.filter_counts[1] = wc1;
-                            meta_w2d.filter_word_modes[1] = 1;
-                            meta_w2d.compressed_bits = plan_w2d.payload_bits;
-                            size_t size_w2d = 0;
-                            uint8_t *stream_w2d = encode_plan_to_stream(
-                                buf_w2, &plan_w2d, format, ZX0_DEFAULT_LSB_BITS, &meta_w2d, &size_w2d
-                            );
-                            free(plan_w2d.tokens);
-                            #pragma omp critical
-                            {
-                                if (size_w2d < best_size ||
-                                    (size_w2d == best_size && meta_w2d.compressed_bits < best_meta.compressed_bits)) {
-                                    free(best_stream);
-                                    best_stream = stream_w2d;
-                                    best_size = size_w2d;
-                                    best_meta = meta_w2d;
-                                } else {
-                                    free(stream_w2d);
+                            if (solve_exact_parse(buf_w2, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, stride_req_off, &plan_w2d)) {
+                                UltraMetadata meta_w2d;
+                                memset(&meta_w2d, 0, sizeof(meta_w2d));
+                                meta_w2d.format = format;
+                                meta_w2d.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
+                                meta_w2d.literal_bits = (format == ULTRA_FORMAT_ULTRA_128B)
+                                                      ? detect_buffer_literal_bits(buf_w2, input_size, NULL) : 8;
+                                meta_w2d.filter_passes = 2;
+                                meta_w2d.filter_stride = 2;
+                                meta_w2d.filter_strides[0] = s2;
+                                meta_w2d.filter_counts[0] = wc2;
+                                meta_w2d.filter_word_modes[0] = 1;
+                                meta_w2d.filter_strides[1] = 2;
+                                meta_w2d.filter_counts[1] = wc1;
+                                meta_w2d.filter_word_modes[1] = 1;
+                                meta_w2d.compressed_bits = plan_w2d.payload_bits;
+                                size_t size_w2d = 0;
+                                uint8_t *stream_w2d = encode_plan_to_stream(
+                                    buf_w2, &plan_w2d, format, ZX0_DEFAULT_LSB_BITS, &meta_w2d, &size_w2d
+                                );
+                                free(plan_w2d.tokens);
+                                #pragma omp critical
+                                {
+                                    if (size_w2d < best_size ||
+                                        (size_w2d == best_size && meta_w2d.compressed_bits < best_meta.compressed_bits)) {
+                                        free(best_stream);
+                                        best_stream = stream_w2d;
+                                        best_size = size_w2d;
+                                        best_meta = meta_w2d;
+                                    } else {
+                                        free(stream_w2d);
+                                    }
                                 }
                             }
-                        }
                             free(buf_w2);
                         }
                     }
@@ -3321,17 +3582,20 @@ uint8_t *ultra_compress_buffer(
                         if (st >= input_size) {
                             continue;
                         }
+                        if (input_size >= 8192 && st != 1 && st != 2 && st != 4 && st != 16) {
+                            continue;
+                        }
                         int kg = 0, ub = 0;
                         int kt = find_optimal_stride_tail_count(working_input, input_size, st, &kg, &ub);
-                        if (st > 2 && kg < 16) {
+                        if ((st > 2 && kg < 16) || (input_size >= 8192 && kg < 64)) {
                             continue;
                         }
                         int c_tails[4];
                         int n_ct = 0;
                         if (kg >= 8 && kt > st && kt < input_size - st) c_tails[n_ct++] = kt;
-                        if (kg >= 8 && ub > st && ub < input_size - st && ub != kt) c_tails[n_ct++] = ub;
+                        if (input_size < 8192 && kg >= 8 && ub > st && ub < input_size - st && ub != kt) c_tails[n_ct++] = ub;
                         if (input_size / 2 > st) c_tails[n_ct++] = input_size / 2;
-                        if (input_size >= 3072 && 2048 > st) c_tails[n_ct++] = 2048;
+                        if (input_size < 8192 && input_size >= 3072 && 2048 > st) c_tails[n_ct++] = 2048;
                         if (n_ct == 0) {
                             continue;
                         }
@@ -3350,8 +3614,8 @@ uint8_t *ultra_compress_buffer(
                                     apply_forward_stride_difference(st_buf, e9_on_st, input_size, st, t_st);
                                     memcpy(st_buf, e9_on_st, (size_t)input_size);
                                 }
-                                /* For PRO_111B & ULTRA_128B: can use 1-pass E8 (V=1049) directly followed by Stride without dummy E9! */
-                                if (is_word_capable &&
+                                /* For HYBRID_108B, PRO_111B & ULTRA_128B: can use 1-pass E8 (V=1049/536) directly followed by Stride without dummy E9! */
+                                if (is_multi_stage &&
                                     st_buf[input_size - 2] != X86_OPCODE_CALL_REL16 &&
                                     st_buf[input_size - 1] != X86_OPCODE_CALL_REL16) {
                                     int h8_direct = apply_forward_x86_opcode_filter(
@@ -3399,13 +3663,14 @@ uint8_t *ultra_compress_buffer(
                                 }
 
                                 /* Decoder runs E8 -> E9 -> Stride, so encoder applies Stride -> E9 -> E8 */
-                                int e9_tail = 3;
-                                if (!is_word_capable &&
+                                if (format != ULTRA_FORMAT_ULTRA_128B &&
                                     st_buf[input_size - 2] != X86_OPCODE_JMP_REL16 &&
-                                    st_buf[input_size - 1] != X86_OPCODE_JMP_REL16 &&
-                                    st_buf[input_size - 3] != X86_OPCODE_JMP_REL16) {
-                                    memcpy(e9_on_st, st_buf, (size_t)input_size);
-                                    if (e9_on_st[input_size - 2] != X86_OPCODE_CALL_REL16 &&
+                                    st_buf[input_size - 1] != X86_OPCODE_JMP_REL16) {
+                                    int h9 = apply_forward_x86_opcode_filter(
+                                        st_buf, e9_on_st, input_size, best_e8_tail_chosen, X86_OPCODE_JMP_REL16
+                                    );
+                                    if (h9 >= 2 &&
+                                        e9_on_st[input_size - 2] != X86_OPCODE_CALL_REL16 &&
                                         e9_on_st[input_size - 1] != X86_OPCODE_CALL_REL16) {
                                         int h8 = apply_forward_x86_opcode_filter(
                                             e9_on_st, e8_on_st, input_size, best_e8_tail_chosen, X86_OPCODE_CALL_REL16
@@ -3417,14 +3682,13 @@ uint8_t *ultra_compress_buffer(
                                                 memset(&meta_hyb, 0, sizeof(meta_hyb));
                                                 meta_hyb.format = format;
                                                 meta_hyb.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
-                                                meta_hyb.literal_bits = (format == ULTRA_FORMAT_ULTRA_128B)
-                                                                      ? detect_buffer_literal_bits(e8_on_st, input_size, NULL) : 8;
+                                                meta_hyb.literal_bits = 8;
                                                 meta_hyb.filter_passes = 2 + p;
-                                                meta_hyb.filter_stride = 0; /* Signals V=281/537 (E8+E9 entry) */
+                                                meta_hyb.filter_stride = 0; /* Signals V=537 (E8+E9 entry) */
                                                 meta_hyb.filter_strides[0] = 0;
                                                 meta_hyb.filter_counts[0] = best_e8_tail_chosen;
                                                 meta_hyb.filter_strides[1] = 0;
-                                                meta_hyb.filter_counts[1] = e9_tail;
+                                                meta_hyb.filter_counts[1] = best_e8_tail_chosen;
                                                 for (int pk = 0; pk < p; pk++) {
                                                     meta_hyb.filter_strides[2 + pk] = st;
                                                     meta_hyb.filter_counts[2 + pk] = t_st;
@@ -3466,50 +3730,20 @@ uint8_t *ultra_compress_buffer(
 
         /*
          * Final Exact DH Sentinel Refinement for ULTRA_FORMAT_ULTRA_128B:
-         * Evaluate candidate DH sentinels (whole_dh, 3, 4, 9, 10, 11, 16, 32, 64) in parallel
-         * across OpenMP threads on the winning post-filtered buffer (and on working_input if
-         * unfiltered remains within 6 bytes of the filtered best) so literal prefix coding is
-         * globally optimal without wasted pre-filter evaluations.
+         * Rank all 127 DH sentinels by exact byte-histogram cost on the winning post-filtered
+         * buffer (and on working_input if unfiltered remains competitive) and evaluate the top 12
+         * candidates in parallel across OpenMP threads.
          */
         if (format == ULTRA_FORMAT_ULTRA_128B) {
+            int max_dh_cands = (input_size >= 8192) ? 6 : 12;
             if (best_meta.filter_passes == 0 || base_unfiltered_size <= best_size + 6) {
                 int raw_est_dh = find_best_dh_sentinel(working_input, input_size, NULL);
-                int whole_dh = find_best_whole_dh_sentinel(working_input, input_size, NULL);
-                int raw_alt_dhs[9] = {whole_dh, 3, 4, 9, 10, 11, 16, 32, 64};
-                int uniq_dhs[9];
-                int n_uniq = 0;
-                for (int ai = 0; ai < 9; ai++) {
-                    int adh = raw_alt_dhs[ai];
-                    if (adh == raw_est_dh || adh < 1 || adh > 127) {
-                        continue;
-                    }
-                    int dup = 0;
-                    for (int prev = 0; prev < n_uniq; prev++) {
-                        if (uniq_dhs[prev] == adh) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    if (!dup) {
-                        uniq_dhs[n_uniq++] = adh;
-                    }
-                }
+                int uniq_dhs[12];
+                int n_uniq = rank_top_dh_sentinels(working_input, input_size, raw_est_dh, uniq_dhs, max_dh_cands);
                 int lit_bits_cached = detect_buffer_literal_bits(working_input, input_size, NULL);
                 #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
                 for (int ui = 0; ui < n_uniq; ui++) {
                     int adh = uniq_dhs[ui];
-                    DhSpec spec_check;
-                    build_dh_spec(adh, &spec_check);
-                    int valid = 1;
-                    for (int i = 0; i < input_size; i++) {
-                        if (spec_check.bit_len[working_input[i]] == 0) {
-                            valid = 0;
-                            break;
-                        }
-                    }
-                    if (!valid) {
-                        continue;
-                    }
                     ParsePlan alt_plan = {NULL, 0, 0};
                     if (solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, -adh, &alt_plan)) {
                         UltraMetadata alt_meta;
@@ -3548,8 +3782,8 @@ uint8_t *ultra_compress_buffer(
                 for (int p = best_meta.filter_passes - 1; p >= 0; p--) {
                     int st = best_meta.filter_strides[p];
                     int tc = best_meta.filter_counts[p];
-                    if (st == 0) {
-                        uint8_t op = (p == 1 && best_meta.filter_strides[0] == 0)
+                    if (st <= 0) {
+                        uint8_t op = (st == -1 || (p == 1 && best_meta.filter_strides[0] <= 0))
                                    ? X86_OPCODE_JMP_REL16
                                    : X86_OPCODE_CALL_REL16;
                         apply_forward_x86_opcode_filter(f_cur, f_nxt, input_size, tc, op);
@@ -3561,56 +3795,19 @@ uint8_t *ultra_compress_buffer(
                     memcpy(f_cur, f_nxt, (size_t)input_size);
                 }
 
-                int has_stride_pass = 0;
-                for (int p = 0; p < best_meta.filter_passes; p++) {
-                    if (best_meta.filter_strides[p] > 0) {
-                        has_stride_pass = 1;
-                    }
-                }
                 int est_dh = find_best_dh_sentinel(f_cur, input_size, NULL);
-                int whole_dh = find_best_whole_dh_sentinel(f_cur, input_size, NULL);
                 if (best_meta.dh_sentinel == 0) {
                     best_meta.dh_sentinel = est_dh;
                 }
-                int raw_cand_dhs[9] = {whole_dh, 3, 4, 9, 10, 11, 16, 32, 64};
-                int uniq_ref_dhs[9];
-                int n_ref_dhs = 0;
-                for (int di = 0; di < 9; di++) {
-                    int cdh = raw_cand_dhs[di];
-                    if (cdh == est_dh || cdh < 1 || cdh > 127) {
-                        continue;
-                    }
-                    int dup = 0;
-                    for (int prev = 0; prev < n_ref_dhs; prev++) {
-                        if (uniq_ref_dhs[prev] == cdh) {
-                            dup = 1;
-                            break;
-                        }
-                    }
-                    if (!dup) {
-                        uniq_ref_dhs[n_ref_dhs++] = cdh;
-                    }
-                }
+                int uniq_ref_dhs[12];
+                int n_ref_dhs = rank_top_dh_sentinels(f_cur, input_size, est_dh, uniq_ref_dhs, max_dh_cands);
                 int f_lit_bits = detect_buffer_literal_bits(f_cur, input_size, NULL);
                 UltraMetadata base_win_meta = best_meta;
                 #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
                 for (int ri = 0; ri < n_ref_dhs; ri++) {
                     int cdh = uniq_ref_dhs[ri];
-                    DhSpec sp_chk;
-                    build_dh_spec(cdh, &sp_chk);
-                    int valid = 1;
-                    for (int i = 0; i < input_size; i++) {
-                        if (sp_chk.bit_len[f_cur[i]] == 0) {
-                            valid = 0;
-                            break;
-                        }
-                    }
-                    if (!valid) {
-                        continue;
-                    }
-                    int ref_req_off = has_stride_pass ? (-300 - cdh) : -cdh;
                     ParsePlan ref_plan = {NULL, 0, 0};
-                    if (solve_exact_parse(f_cur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, ref_req_off, &ref_plan)) {
+                    if (solve_exact_parse(f_cur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, -cdh, &ref_plan)) {
                         UltraMetadata ref_meta = base_win_meta;
                         ref_meta.dh_sentinel = cdh;
                         ref_meta.literal_bits = f_lit_bits;

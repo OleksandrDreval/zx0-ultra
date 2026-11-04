@@ -20,9 +20,9 @@ static inline int omp_in_parallel(void) { return 0; }
 #define MAX_PACK_ASSETS                 14
 #define EXACT_FACTORIAL_ASSET_LIMIT     8
 #define MAX_HEURISTIC_PERMUTATIONS      256
-#define ELITE_BYTE_SLACK                4
-#define MAX_ELITE_PERMUTATIONS          8
-#define MAX_WILDCARD_BRIDGE_LEN         4
+#define ELITE_BYTE_SLACK                6
+#define MAX_ELITE_PERMUTATIONS          24
+#define MAX_WILDCARD_BRIDGE_LEN         6
 
 static int compute_max_overlap(const UltraAsset *left, const UltraAsset *right) {
     int limit = left->length < right->length ? left->length : right->length;
@@ -426,7 +426,7 @@ int ultra_solve_multi_asset_pack(
         } while (next_lexicographic_permutation(cur_perm, active_count));
         assert(p_idx == total_perms);
 
-        if (total_perms > 720 && max_tot_ov >= 5) {
+        if (total_perms > 5040 && max_tot_ov >= 5) {
             int min_keep_ov = max_tot_ov - 4;
             size_t kept = 0;
             for (size_t idx = 0; idx < total_perms; idx++) {
@@ -538,8 +538,12 @@ int ultra_solve_multi_asset_pack(
 
         #pragma omp for schedule(dynamic, 32)
         for (int idx = 0; idx < (int)total_perms; idx++) {
+            int has_nonzero_ov = 0;
             for (int g = 0; g < active_count - 1; g++) {
                 gap_specs[g] = max_ov_table[all_perms[idx][g]][all_perms[idx][g + 1]];
+                if (gap_specs[g] > 0) {
+                    has_nonzero_ov = 1;
+                }
             }
 
             int raw_len = build_candidate_buffer(
@@ -559,6 +563,29 @@ int ultra_solve_multi_asset_pack(
                 comp_bits = meta.compressed_bits;
             }
 
+            if (has_nonzero_ov) {
+                memset(gap_specs, 0, (size_t)(active_count - 1) * sizeof(int));
+                int raw_len0 = build_candidate_buffer(
+                    assets, all_perms[idx], active_count, gap_specs, raw_buf, wc_buf, active_offs
+                );
+                size_t comp_sz0 = 0;
+                int comp_bits0 = 0;
+                if (phase1_format == ULTRA_FORMAT_ZX0_V2) {
+                    ultra_screen_zx0_v2(raw_buf, raw_len0, NULL, ZX0_MAX_OFFSET, &comp_sz0, &comp_bits0);
+                } else {
+                    UltraMetadata meta0;
+                    uint8_t *comp0 = ultra_compress_buffer(
+                        raw_buf, raw_len0, NULL, phase1_format, ZX0_MAX_OFFSET, &comp_sz0, &meta0, NULL
+                    );
+                    free(comp0);
+                    comp_bits0 = meta0.compressed_bits;
+                }
+                if (comp_sz0 < comp_sz || (comp_sz0 == comp_sz && comp_bits0 < comp_bits)) {
+                    comp_sz = comp_sz0;
+                    comp_bits = comp_bits0;
+                }
+            }
+
             memcpy(perm_scores[idx].perm, all_perms[idx], (size_t)active_count * sizeof(int));
             perm_scores[idx].best_bytes = comp_sz;
             perm_scores[idx].best_bits = comp_bits;
@@ -575,7 +602,7 @@ int ultra_solve_multi_asset_pack(
             phase1_min_bytes = perm_scores[idx].best_bytes;
         }
     }
-    int max_elite_cap = use_fast_phase1_screen ? 8 : MAX_ELITE_PERMUTATIONS;
+    int max_elite_cap = use_fast_phase1_screen ? 12 : MAX_ELITE_PERMUTATIONS;
     int (*elite_perms)[MAX_PACK_ASSETS] = malloc((size_t)max_elite_cap * sizeof(*elite_perms));
     assert(elite_perms != NULL);
     int elite_count = 0;
@@ -600,15 +627,20 @@ int ultra_solve_multi_asset_pack(
         }
     }
 
-    /* Phase 2: Exhaustive partial-overlap bitmasks + 1..4 byte Wildcard Bridges on elite permutations */
+    /* Phase 2: Exhaustive partial-overlap bitmasks + 1..MAX_WILDCARD_BRIDGE_LEN byte Wildcard Bridges on elite permutations */
     #pragma omp parallel for schedule(dynamic, 1)
     for (int e = 0; e < elite_count; e++) {
         const int *perm = elite_perms[e];
         uint8_t *raw_buf = (uint8_t *)malloc((size_t)max_raw_capacity);
         uint8_t *wc_buf = (uint8_t *)malloc((size_t)max_raw_capacity);
         int base_gaps[MAX_PACK_ASSETS];
+        int best_ov_gaps[MAX_PACK_ASSETS];
         int active_offs[MAX_PACK_ASSETS];
         assert(raw_buf != NULL && wc_buf != NULL);
+
+        for (int g = 0; g < active_count - 1; g++) {
+            best_ov_gaps[g] = max_ov_table[perm[g]][perm[g + 1]];
+        }
 
         /* 2A: Enumerate all valid partial overlap combinations (0 .. max_ov_g) across all boundaries */
         int total_ov_combos = 1;
@@ -637,8 +669,8 @@ int ultra_solve_multi_asset_pack(
         }
 
         int best_screen_combo = 0;
+        int best_ov_bits = 0x3fffffff;
         if (use_fast_phase1_screen && total_ov_combos > 1) {
-            int best_screen_bits = 0x3fffffff;
             for (int combo = 0; combo < total_ov_combos; combo++) {
                 int rem = combo;
                 for (int g = 0; g < active_count - 1; g++) {
@@ -651,13 +683,15 @@ int ultra_solve_multi_asset_pack(
                 size_t c_sz = 0;
                 int c_bits = 0;
                 ultra_screen_zx0_v2(raw_buf, raw_len, NULL, ZX0_MAX_OFFSET, &c_sz, &c_bits);
-                if (c_bits < best_screen_bits) {
-                    best_screen_bits = c_bits;
+                if (c_bits < best_ov_bits) {
+                    best_ov_bits = c_bits;
                     best_screen_combo = combo;
+                    memcpy(best_ov_gaps, base_gaps, (size_t)(active_count - 1) * sizeof(int));
                 }
             }
         }
 
+        best_ov_bits = 0x3fffffff;
         for (int combo = 0; combo < total_ov_combos; combo++) {
             if (use_fast_phase1_screen && combo != 0 && combo != best_screen_combo) {
                 continue;
@@ -677,6 +711,11 @@ int ultra_solve_multi_asset_pack(
             UltraMetadata meta;
             uint8_t *comp = ultra_compress_buffer(raw_buf, raw_len, NULL, format, ZX0_MAX_OFFSET, &comp_sz, &meta, resolved);
 
+            if (meta.compressed_bits < best_ov_bits) {
+                best_ov_bits = meta.compressed_bits;
+                memcpy(best_ov_gaps, base_gaps, (size_t)(active_count - 1) * sizeof(int));
+            }
+
             #pragma omp critical
             {
                 update_global_best(
@@ -689,9 +728,7 @@ int ultra_solve_multi_asset_pack(
 
         /* 2B: Evaluate Wildcard ("Don't-Care") Synthetic Bridges of 1..MAX_WILDCARD_BRIDGE_LEN bytes */
         if (enable_wildcard_bridges && active_count > 1) {
-            for (int g = 0; g < active_count - 1; g++) {
-                base_gaps[g] = max_ov_table[perm[g]][perm[g + 1]];
-            }
+            memcpy(base_gaps, best_ov_gaps, (size_t)(active_count - 1) * sizeof(int));
             int best_b_slot = 0;
             int best_b_wlen = 1;
             if (use_fast_phase1_screen) {

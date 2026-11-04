@@ -380,7 +380,7 @@ def main() -> None:
             os.path.join(ASM_DIR, "unzx0_67b.asm"), os.path.join(tmpdir, "d67.bin")
         )
         dec_78b = assemble_flat_binary(
-            os.path.join(ASM_DIR, "unzx0_adpk_77b.asm"), os.path.join(tmpdir, "d78.bin")
+            os.path.join(ASM_DIR, "unzx0_adpk_78b.asm"), os.path.join(tmpdir, "d78.bin")
         )
         dec_80b = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_strd_80b.asm"), os.path.join(tmpdir, "d80.bin")
@@ -397,8 +397,8 @@ def main() -> None:
         dec_univ_93 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_univ_93b.asm"), os.path.join(tmpdir, "du93.bin")
         )
-        dec_hybrid_108 = assemble_flat_binary(
-            os.path.join(ASM_DIR, "unzx0_hybrid_108b.asm"), os.path.join(tmpdir, "dh108.bin")
+        dec_hybrid_104 = assemble_flat_binary(
+            os.path.join(ASM_DIR, "unzx0_hybrid_104b.asm"), os.path.join(tmpdir, "dh104.bin")
         )
         dec_pro_111 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_pro_111b.asm"), os.path.join(tmpdir, "dp111.bin")
@@ -412,15 +412,15 @@ def main() -> None:
         print("=" * 162)
         print(f"  ZX things/unzx0_x86.asm          : {len(dec_x86_main):3d} bytes ({len(dec_x86_main)-70:+d}B vs 70B, 100% ZX0 v2 reference)")
         print(f"  zx0_ultra/asm/unzx0_67b.asm      : {len(dec_67b):3d} bytes ({len(dec_67b)-70:+d}B vs 70B, 100% ZX0 v2 compatible)")
-        print(f"  zx0_ultra/asm/unzx0_adpk_77b     : {len(dec_78b):3d} bytes ({len(dec_78b)-70:+d}B vs 70B, Adaptive-k 1..12 offset LSB)")
-        print(f"  zx0_ultra/asm/unzx0_strd_80b     : {len(dec_80b):3d} bytes ({len(dec_80b)-70:+d}B vs 70B, Order-1 16-bit Stride-Delta)")
-        print(f"  zx0_ultra/asm/unzx0_compat_82b   : {len(dec_compat82):3d} bytes ({len(dec_compat82)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride)")
-        print(f"  zx0_ultra/asm/unzx0_strd_82b     : {len(dec_strd82):3d} bytes ({len(dec_strd82)-70:+d}B vs 70B, Multi-Pass Order-1..5 Stride)")
-        print(f"  zx0_ultra/asm/unzx0_x86e8_84b    : {len(dec_x86e8_84):3d} bytes ({len(dec_x86e8_84)-70:+d}B vs 70B, 0B-ovh ZX0 compat + x86 E8 Call)")
-        print(f"  zx0_ultra/asm/unzx0_univ_93b     : {len(dec_univ_93):3d} bytes ({len(dec_univ_93)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride + E8)")
-        print(f"  zx0_ultra/asm/unzx0_hybrid_108b  : {len(dec_hybrid_108):3d} bytes ({len(dec_hybrid_108)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride)")
-        print(f"  zx0_ultra/asm/unzx0_pro_111b     : {len(dec_pro_111):3d} bytes ({len(dec_pro_111)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride)")
-        print(f"  zx0_ultra/asm/unzx0_ultra_128b   : {len(dec_ultra_128):3d} bytes ({len(dec_ultra_128)-70:+d}B vs 70B, Asymmetric Split-Domain DH=1..127 + E8/E9 + 16b/8b 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_adpk_78b.asm : {len(dec_78b):3d} bytes ({len(dec_78b)-70:+d}B vs 70B, Adaptive-k 1..12 offset LSB)")
+        print(f"  zx0_ultra/asm/unzx0_strd_80b.asm : {len(dec_80b):3d} bytes ({len(dec_80b)-70:+d}B vs 70B, Order-1 16-bit Stride-Delta)")
+        print(f"  zx0_ultra/asm/unzx0_compat_82b.asm: {len(dec_compat82):3d} bytes ({len(dec_compat82)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride)")
+        print(f"  zx0_ultra/asm/unzx0_strd_82b.asm : {len(dec_strd82):3d} bytes ({len(dec_strd82)-70:+d}B vs 70B, Multi-Pass Order-1..5 Stride)")
+        print(f"  zx0_ultra/asm/unzx0_x86e8_84b.asm: {len(dec_x86e8_84):3d} bytes ({len(dec_x86e8_84)-70:+d}B vs 70B, 0B-ovh ZX0 compat + x86 E8 Call)")
+        print(f"  zx0_ultra/asm/unzx0_univ_93b.asm : {len(dec_univ_93):3d} bytes ({len(dec_univ_93)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride + E8)")
+        print(f"  zx0_ultra/asm/unzx0_hybrid_104b.asm: {len(dec_hybrid_104):3d} bytes ({len(dec_hybrid_104)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_pro_111b.asm : {len(dec_pro_111):3d} bytes ({len(dec_pro_111)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_ultra_128b.asm: {len(dec_ultra_128):3d} bytes ({len(dec_ultra_128)-70:+d}B vs 70B, Asymmetric Split-Domain DH=1..127 + E8/E9 + 16b/8b 2D Stride)")
 
         assert len(dec_x86_main) == 67
         assert len(dec_67b) == 67
@@ -430,7 +430,7 @@ def main() -> None:
         assert len(dec_strd82) == 82
         assert len(dec_x86e8_84) == 84
         assert len(dec_univ_93) == 93
-        assert len(dec_hybrid_108) == 108
+        assert len(dec_hybrid_104) == 104
         assert len(dec_pro_111) == 111
         assert len(dec_ultra_128) == 128, f"unzx0_ultra_128b.asm must be exactly 128B (got {len(dec_ultra_128)}B)"
 
@@ -447,7 +447,7 @@ def main() -> None:
             header = (
                 f"{'Dataset':32s} | {'Raw':>6s} | {'OrigZX0':>7s} | {'UltZX0':>6s} | "
                 f"{'AdpK78':>6s} | {'Strd80':>6s} | {'Cmp82':>6s} | {'Strd82':>6s} | {'X86E84':>6s} | "
-                f"{'Univ93':>6s} | {'Hyb108':>6s} | {'Pro111':>6s} | {'Ult128':>6s} | {'SHA-256':12s}"
+                f"{'Univ93':>6s} | {'Hyb104':>6s} | {'Pro111':>6s} | {'Ult128':>6s} | {'SHA-256':12s}"
             )
             print(header)
             print("-" * 162)
@@ -461,7 +461,7 @@ def main() -> None:
                 expected_hash = sha256_hex(raw)
                 local_checks = 0
 
-                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, 108B-hybrid, AND 111B-pro!)
+                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, 104B-hybrid, AND 111B-pro!)
                 orig_out = os.path.join(tmpdir, f"{name}.orig.zx0")
                 subprocess.run(
                     [ZX0_ORIG_EXE, "-f", in_p, orig_out],
@@ -474,11 +474,11 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_compat82, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_x86e8_84, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_orig, len(raw))) == expected_hash
-                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_orig, len(raw))) == expected_hash
+                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_orig, len(raw))) == expected_hash
                 local_checks += 6
 
-                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_108b, pro_111b)
+                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_104b, pro_111b)
                 u_zx0_p = os.path.join(tmpdir, f"{name}.uzx0")
                 subprocess.run([ZX0_ULTRA_EXE, "--zx0", in_p, u_zx0_p], check=True, stdout=subprocess.DEVNULL)
                 c_uzx0 = open(u_zx0_p, "rb").read()
@@ -487,11 +487,11 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_compat82, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_x86e8_84, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_uzx0, len(raw))) == expected_hash
-                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_uzx0, len(raw))) == expected_hash
+                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_uzx0, len(raw))) == expected_hash
                 local_checks += 7
 
-                # 3. ZX0-Ultra --adpk77 (verified on 78B unzx0_adpk_77b.asm, k=1..12)
+                # 3. ZX0-Ultra --adpk77 (verified on 78B unzx0_adpk_78b.asm, k=1..12)
                 u_k78_p = os.path.join(tmpdir, f"{name}.k78")
                 subprocess.run([ZX0_ULTRA_EXE, "--adpk77", in_p, u_k78_p], check=True, stdout=subprocess.DEVNULL)
                 c_k78 = open(u_k78_p, "rb").read()
@@ -533,11 +533,11 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_u93, len(raw))) == expected_hash
                 local_checks += 1
 
-                # 9. ZX0-Ultra --hybrid108 (verified on 108B unzx0_hybrid_108b.asm)
+                # 9. ZX0-Ultra --hybrid108 (verified on 104B unzx0_hybrid_104b.asm)
                 u_h108_p = os.path.join(tmpdir, f"{name}.h108")
                 subprocess.run([ZX0_ULTRA_EXE, "--hybrid108", in_p, u_h108_p], check=True, stdout=subprocess.DEVNULL)
                 c_h108 = open(u_h108_p, "rb").read()
-                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_108, c_h108, len(raw))) == expected_hash
+                assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_h108, len(raw))) == expected_hash
                 local_checks += 1
 
                 # 10. ZX0-Ultra --pro111 (verified on 111B unzx0_pro_111b.asm)
@@ -628,7 +628,7 @@ def main() -> None:
             ("--strd82", dec_strd82, "STRD-82B (82B decoder)"),
             ("--x86e8", dec_x86e8_84, "X86E8-84B (84B decoder)"),
             ("--univ93", dec_univ_93, "UNIV-93B (93B decoder)"),
-            ("--hybrid108", dec_hybrid_108, "HYBRID-108B (108B decoder)"),
+            ("--hybrid108", dec_hybrid_104, "HYBRID-104B (104B decoder)"),
             ("--pro111", dec_pro_111, "PRO-111B (111B decoder)"),
             ("--ultra128", dec_ultra_128, "ULTRA-128B (128B decoder)"),
         ]

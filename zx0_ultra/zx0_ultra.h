@@ -21,8 +21,12 @@
 #define ZX0_MAX_OFFSET              32640
 #define ZX0_EOF_MSB_VALUE           256
 #define ZX0_EOF_ALT_VALUE           257
+#define ZX0_EOF_E9_VALUE            280
 #define ZX0_EOF_E8_VALUE            281
+#define ZX0_EOF_ULTRA128_E9_VALUE   535
+#define ZX0_EOF_ULTRA128_E8_VALUE   536
 #define ZX0_EOF_ULTRA_E8E9_VALUE    537
+#define ZX0_EOF_ULTRA_E9_VALUE      1048
 #define ZX0_EOF_ULTRA_E8_VALUE      1049
 #define ZX0_LITERAL_BITS_PER_BYTE   8
 

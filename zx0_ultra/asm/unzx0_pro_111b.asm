@@ -97,7 +97,7 @@ dzx0:
     inc ax
     js .e8_loop
     lodsw
-    mov dh, ah
+    cwd
     cbw
     xchg ax, bx
 
@@ -106,10 +106,11 @@ dzx0:
     add [di], al
     inc di
     inc dx
-    jns .fnext
+    jnz .fnext
     adc [di], ah
     inc di
     dec cx
+    dec dx
 
 .fnext:
     loop .floop
