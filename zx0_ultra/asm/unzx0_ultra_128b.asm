@@ -53,6 +53,7 @@ dzx0:
     call .get_bit
     adc al, al
     jnc .lit_bit
+    dec ax
     stosb
     loop .lit_loop
     call .get_bit
@@ -126,14 +127,13 @@ dzx0:
     xchg ax, bx
 
 .floop:
-    mov ax, [bx+di]
+    mov al, [bx+di]
     add [di], al
     inc di
     inc dx
     jnz .fnext
-    adc [di], ah
-    inc di
-    dec cx
+    adc [di], dh
+    dec dx
     dec dx
 
 .fnext:

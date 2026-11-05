@@ -294,12 +294,13 @@ static void build_dh_spec(int dh, DhSpec *spec) {
         int m = 8 - k;
         int base = (v - (1 << k)) << m;
         for (int val = base; val < base + (1 << m) && val < 256; val++) {
+            uint8_t out_b = (uint8_t)((val - 1) & 0xFF);
             uint8_t total_bits = (uint8_t)(1 + m);
-            if (spec->bit_len[val] == 0 || total_bits < spec->bit_len[val]) {
-                spec->bit_len[val] = total_bits;
-                spec->prefix_bit[val] = (uint8_t)p;
-                spec->payload_len[val] = (uint8_t)m;
-                spec->payload_val[val] = (uint8_t)(val - base);
+            if (spec->bit_len[out_b] == 0 || total_bits < spec->bit_len[out_b]) {
+                spec->bit_len[out_b] = total_bits;
+                spec->prefix_bit[out_b] = (uint8_t)p;
+                spec->payload_len[out_b] = (uint8_t)m;
+                spec->payload_val[out_b] = (uint8_t)(val - base);
                 if (total_bits < spec->min_len) {
                     spec->min_len = total_bits;
                 }
@@ -336,6 +337,7 @@ typedef struct {
     int *final_mat_node;
     int pair_pos_initialized;
     int last_pair_pos[65536];
+    int last_quad_pos[65536];
 } DpWorkspace;
 
 static _Thread_local DpWorkspace tls_dp = {0};
@@ -377,25 +379,34 @@ static void dp_workspace_ensure(DpWorkspace *ws, int n, int w) {
     node_pool_ensure_capacity(&ws->pool, n * 4 + 1024);
 }
 
+static inline uint16_t hash_quad_bytes(const uint8_t *p) {
+    uint32_t v = ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return (uint16_t)((v * 2654435761u) >> 16);
+}
+
 static int find_best_dh_sentinel(
     const uint8_t *input_data,
     int input_size,
     const uint8_t *wildcard_mask
 ) {
-    int best_dh = 3;
+    int best_dh = 4;
     DhSpec spec;
 
     /*
      * Estimate which positions are likely to be emitted as literals rather than LZ77 matches (>= 2B)
-     * in O(N) time with zero heap allocations, then evaluate all 127 DH sentinels in O(127 * 256)
-     * over precomputed byte histograms hist_lit[256] and hist_whole[256].
+     * in O(N) time with zero heap allocations using both 4-byte (long-range periodic/block match)
+     * and 2-byte (short-range match) hash tables, then evaluate all 127 DH sentinels in O(127 * 256).
      */
     if (!tls_dp.pair_pos_initialized) {
         memset(tls_dp.last_pair_pos, -1, sizeof(tls_dp.last_pair_pos));
+        memset(tls_dp.last_quad_pos, -1, sizeof(tls_dp.last_quad_pos));
         tls_dp.pair_pos_initialized = 1;
     } else {
         for (int i = 0; i + 1 < input_size; i++) {
             tls_dp.last_pair_pos[((int)input_data[i] << 8) | (int)input_data[i + 1]] = -1;
+            if (i + 3 < input_size) {
+                tls_dp.last_quad_pos[hash_quad_bytes(&input_data[i])] = -1;
+            }
         }
     }
 
@@ -413,6 +424,7 @@ static int find_best_dh_sentinel(
     }
 
     int *last_pair_pos = tls_dp.last_pair_pos;
+    int *last_quad_pos = tls_dp.last_quad_pos;
     int pos = 0;
     while (pos < input_size) {
         if (wildcard_mask != NULL && wildcard_mask[pos] != 0) {
@@ -420,14 +432,31 @@ static int find_best_dh_sentinel(
             continue;
         }
         int best_ml = 0;
+        if (pos + 3 < input_size && wildcard_mask == NULL) {
+            int qh = (int)hash_quad_bytes(&input_data[pos]);
+            int qprev = last_quad_pos[qh];
+            if (qprev >= 0 && (pos - qprev) <= ZX0_MAX_OFFSET) {
+                int qml = 0;
+                while (pos + qml < input_size && input_data[qprev + qml] == input_data[pos + qml]) {
+                    qml++;
+                }
+                if (qml > best_ml) {
+                    best_ml = qml;
+                }
+            }
+        }
         if (pos + 1 < input_size && (wildcard_mask == NULL || wildcard_mask[pos + 1] == 0)) {
             int h = ((int)input_data[pos] << 8) | (int)input_data[pos + 1];
             int prev = last_pair_pos[h];
             if (prev >= 0 && (pos - prev) <= ZX0_MAX_OFFSET) {
-                while (pos + best_ml < input_size &&
-                       (wildcard_mask == NULL || wildcard_mask[pos + best_ml] == 0) &&
-                       input_data[prev + best_ml] == input_data[pos + best_ml]) {
-                    best_ml++;
+                int pml = 0;
+                while (pos + pml < input_size &&
+                       (wildcard_mask == NULL || wildcard_mask[pos + pml] == 0) &&
+                       input_data[prev + pml] == input_data[pos + pml]) {
+                    pml++;
+                }
+                if (pml > best_ml) {
+                    best_ml = pml;
                 }
             }
         }
@@ -448,6 +477,9 @@ static int find_best_dh_sentinel(
                 if (pos + k + 1 < input_size) {
                     last_pair_pos[((int)input_data[pos + k] << 8) | (int)input_data[pos + k + 1]] = pos + k;
                 }
+                if (pos + k + 3 < input_size && wildcard_mask == NULL) {
+                    last_quad_pos[hash_quad_bytes(&input_data[pos + k])] = pos + k;
+                }
             }
             pos += best_ml;
         } else {
@@ -456,13 +488,16 @@ static int find_best_dh_sentinel(
             if (pos + 1 < input_size) {
                 last_pair_pos[((int)input_data[pos] << 8) | (int)input_data[pos + 1]] = pos;
             }
+            if (pos + 3 < input_size && wildcard_mask == NULL) {
+                last_quad_pos[hash_quad_bytes(&input_data[pos])] = pos;
+            }
             pos++;
         }
     }
 
     int use_lit_estimate = (lit_count >= 8);
-    int best_bits = use_lit_estimate ? (lit_count * 8) : (input_size * 8);
-    int best_whole_bits = input_size * 8;
+    int best_bits = use_lit_estimate ? (lit_count * 9) : (input_size * 9);
+    int best_whole_bits = input_size * 9;
 
     for (int dh = 1; dh <= 127; dh++) {
         build_dh_spec(dh, &spec);
@@ -486,7 +521,7 @@ static int find_best_dh_sentinel(
         }
         if (sum_lit < best_bits ||
             (sum_lit == best_bits && sum_whole < best_whole_bits) ||
-            (sum_lit == best_bits && sum_whole == best_whole_bits && dh == 3)) {
+            (sum_lit == best_bits && sum_whole == best_whole_bits && dh == 4)) {
             best_bits = sum_lit;
             best_whole_bits = sum_whole;
             best_dh = dh;
@@ -501,8 +536,8 @@ static int find_best_whole_dh_sentinel(
     int input_size,
     const uint8_t *wildcard_mask
 ) {
-    int best_dh = 3;
-    int best_bits = input_size * 8;
+    int best_dh = 4;
+    int best_bits = input_size * 9;
     DhSpec spec;
 
     int hist_whole[256] = {0};
@@ -533,7 +568,7 @@ static int find_best_whole_dh_sentinel(
         if (!ok) {
             continue;
         }
-        if (sum < best_bits || (sum == best_bits && dh == 3)) {
+        if (sum < best_bits || (sum == best_bits && dh == 4)) {
             best_bits = sum;
             best_dh = dh;
         }
@@ -558,25 +593,48 @@ static int rank_top_dh_sentinels(
 
     if (!tls_dp.pair_pos_initialized) {
         memset(tls_dp.last_pair_pos, -1, sizeof(tls_dp.last_pair_pos));
+        memset(tls_dp.last_quad_pos, -1, sizeof(tls_dp.last_quad_pos));
         tls_dp.pair_pos_initialized = 1;
     } else {
         for (int i = 0; i + 1 < input_size; i++) {
             tls_dp.last_pair_pos[((int)input_data[i] << 8) | (int)input_data[i + 1]] = -1;
+            if (i + 3 < input_size) {
+                tls_dp.last_quad_pos[hash_quad_bytes(&input_data[i])] = -1;
+            }
         }
     }
     int *last_pair_pos = tls_dp.last_pair_pos;
+    int *last_quad_pos = tls_dp.last_quad_pos;
     int pos = 0;
     while (pos < input_size) {
         int best_ml = 0;
         int best_off = 0;
+        if (pos + 3 < input_size) {
+            int qh = (int)hash_quad_bytes(&input_data[pos]);
+            int qprev = last_quad_pos[qh];
+            if (qprev >= 0 && (pos - qprev) <= ZX0_MAX_OFFSET) {
+                int qml = 0;
+                while (pos + qml < input_size && input_data[qprev + qml] == input_data[pos + qml]) {
+                    qml++;
+                }
+                if (qml > best_ml) {
+                    best_ml = qml;
+                    best_off = pos - qprev;
+                }
+            }
+        }
         if (pos + 1 < input_size) {
             int h = ((int)input_data[pos] << 8) | (int)input_data[pos + 1];
             int prev = last_pair_pos[h];
             if (prev >= 0 && (pos - prev) <= ZX0_MAX_OFFSET) {
-                while (pos + best_ml < input_size && input_data[prev + best_ml] == input_data[pos + best_ml]) {
-                    best_ml++;
+                int pml = 0;
+                while (pos + pml < input_size && input_data[prev + pml] == input_data[pos + pml]) {
+                    pml++;
                 }
-                best_off = pos - prev;
+                if (pml > best_ml || (pml == best_ml && (pos - prev) < best_off)) {
+                    best_ml = pml;
+                    best_off = pos - prev;
+                }
             }
         }
         if (pos > 0 && input_data[pos] == input_data[pos - 1]) {
@@ -594,6 +652,9 @@ static int rank_top_dh_sentinels(
                 if (pos + k + 1 < input_size) {
                     last_pair_pos[((int)input_data[pos + k] << 8) | (int)input_data[pos + k + 1]] = pos + k;
                 }
+                if (pos + k + 3 < input_size) {
+                    last_quad_pos[hash_quad_bytes(&input_data[pos + k])] = pos + k;
+                }
             }
             pos += best_ml;
         } else {
@@ -601,6 +662,9 @@ static int rank_top_dh_sentinels(
             lit_count++;
             if (pos + 1 < input_size) {
                 last_pair_pos[((int)input_data[pos] << 8) | (int)input_data[pos + 1]] = pos;
+            }
+            if (pos + 3 < input_size) {
+                last_quad_pos[hash_quad_bytes(&input_data[pos])] = pos;
             }
             pos++;
         }
@@ -655,7 +719,7 @@ static int rank_top_dh_sentinels(
     }
 
     int count = 0;
-    for (int i = 0; i < n_cand && i < 5 && count < max_out; i++) {
+    for (int i = 0; i < n_cand && i < 6 && count < max_out; i++) {
         int ldh = cand_dh_lit[i];
         int dup = 0;
         for (int k = 0; k < count; k++) {
@@ -711,6 +775,80 @@ static int rank_top_dh_sentinels(
         if (!dup) {
             out_dhs[count++] = cdh;
         }
+    }
+    return count;
+}
+
+/*
+ * Exact DP-Plan Literal Histogram Ranking for ULTRA_128B:
+ * Extracts the true literal byte distribution from an actual DP ParsePlan and ranks
+ * DH sentinels by their exact literal bit cost on those tokens.
+ */
+static int rank_top_dh_sentinels_from_plan(
+    const uint8_t *input_data,
+    int input_size,
+    const ParsePlan *plan,
+    int *out_dhs,
+    int max_out
+) {
+    int hist_whole[256] = {0};
+    int hist_plan_lit[256] = {0};
+    int plan_lit_count = 0;
+    for (int i = 0; i < input_size; i++) {
+        hist_whole[input_data[i]]++;
+    }
+    if (plan != NULL && plan->tokens != NULL) {
+        int pos = 0;
+        for (int t = 0; t < plan->token_count; t++) {
+            int len = plan->tokens[t].length;
+            int off = plan->tokens[t].offset;
+            if (off == 0) {
+                for (int k = 0; k < len && pos + k < input_size; k++) {
+                    hist_plan_lit[input_data[pos + k]]++;
+                    plan_lit_count++;
+                }
+            }
+            pos += len;
+        }
+    }
+    if (plan_lit_count == 0) {
+        return rank_top_dh_sentinels(input_data, input_size, -1, out_dhs, max_out);
+    }
+
+    int cand_dh[128];
+    int cand_score[128];
+    int n_cand = 0;
+    DhSpec spec;
+    for (int dh = 1; dh <= 127; dh++) {
+        build_dh_spec(dh, &spec);
+        int sum_l = 0;
+        int ok = 1;
+        for (int b = 0; b < 256; b++) {
+            if (hist_whole[b] > 0 && spec.bit_len[b] == 0) {
+                ok = 0;
+                break;
+            }
+            if (hist_plan_lit[b] > 0) {
+                sum_l += hist_plan_lit[b] * (int)spec.bit_len[b];
+            }
+        }
+        if (ok) {
+            cand_dh[n_cand] = dh;
+            cand_score[n_cand] = sum_l;
+            n_cand++;
+        }
+    }
+    for (int i = 0; i < n_cand; i++) {
+        for (int j = i + 1; j < n_cand; j++) {
+            if (cand_score[j] < cand_score[i]) {
+                int ts = cand_score[i]; cand_score[i] = cand_score[j]; cand_score[j] = ts;
+                int td = cand_dh[i]; cand_dh[i] = cand_dh[j]; cand_dh[j] = td;
+            }
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < n_cand && count < max_out; i++) {
+        out_dhs[count++] = cand_dh[i];
     }
     return count;
 }
@@ -1085,10 +1223,10 @@ static int solve_exact_parse(
             int match_steps = 0;
             int max_seen_ml = 1;
             int max_chain_steps = deep ? 32640 : 4096;
-            int max_match_steps = deep ? 8192 : 256;
-            int raw_pad = deep ? 64 : 6;
-            int mat_pad = deep ? 64 : 16;
-            int f_pad = deep ? 128 : 32;
+            int max_match_steps = deep ? 8192 : 512;
+            int raw_pad = deep ? 64 : 16;
+            int mat_pad = deep ? 64 : 24;
+            int f_pad = deep ? 128 : 48;
 
             while (idx1 >= min_idx1) {
                 if (++chain_steps > max_chain_steps) {
@@ -2008,7 +2146,7 @@ uint8_t *ultra_decompress_buffer(
                     }
                     al = (al << 1) | bit;
                 }
-                out[out_pos++] = (uint8_t)(al & 0xFF);
+                out[out_pos++] = (uint8_t)((al - 1) & 0xFF);
             }
         } else {
             for (int i = 0; i < lit_len; i++) {
@@ -2918,7 +3056,7 @@ uint8_t *ultra_compress_buffer(
                 num_strides++;
             }
 
-            if (input_size >= 8192 && num_strides > 8) {
+            if (input_size >= 8192 && num_strides > 12) {
                 for (int i = 0; i < num_strides; i++) {
                     for (int j = i + 1; j < num_strides; j++) {
                         int si_score = cand_df[i] + cand_kg[i] * 2 + ((candidate_strides[i] <= 4 || candidate_strides[i] == 16) ? 300 : 0);
@@ -2930,7 +3068,7 @@ uint8_t *ultra_compress_buffer(
                         }
                     }
                 }
-                int cap_s = (input_size >= 24576) ? 8 : 10;
+                int cap_s = (input_size >= 24576) ? 12 : 14;
                 if (num_strides > cap_s) {
                     num_strides = cap_s;
                 }
@@ -3782,9 +3920,6 @@ uint8_t *ultra_compress_buffer(
                         if (st >= input_size) {
                             continue;
                         }
-                        if (input_size >= 8192 && st != 1 && st != 2 && st != 4 && st != 16) {
-                            continue;
-                        }
                         int kg = 0, ub = 0;
                         int kt = find_optimal_stride_tail_count(working_input, input_size, st, &kg, &ub);
                         if ((st > 2 && kg < 16) || (input_size >= 8192 && kg < 64)) {
@@ -3892,16 +4027,29 @@ uint8_t *ultra_compress_buffer(
 
         /*
          * Final Exact DH Sentinel Refinement for ULTRA_FORMAT_ULTRA_128B:
-         * Rank all 127 DH sentinels by exact byte-histogram cost on the winning post-filtered
-         * buffer (and on working_input if unfiltered remains competitive) and evaluate the top
-         * candidates in parallel across OpenMP threads.
+         * Rank all 127 DH sentinels by exact byte-histogram cost AND by exact DP-parse literal
+         * token distribution on the winning post-filtered buffer (and on working_input if
+         * unfiltered remains competitive) and evaluate the top candidates in parallel.
          */
         if (format == ULTRA_FORMAT_ULTRA_128B) {
-            int max_dh_cands = (input_size >= 8192) ? 8 : 12;
+            int max_dh_cands = (input_size >= 8192) ? 10 : 12;
             if (best_meta.filter_passes == 0 || base_unfiltered_size <= best_size + 6) {
                 int raw_est_dh = find_best_dh_sentinel(working_input, input_size, NULL);
-                int uniq_dhs[12];
+                int uniq_dhs[16];
                 int n_uniq = rank_top_dh_sentinels(working_input, input_size, raw_est_dh, uniq_dhs, max_dh_cands);
+                ParsePlan ref_plan8 = {NULL, 0, 0};
+                if (solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &ref_plan8)) {
+                    int plan_dhs[6];
+                    int np = rank_top_dh_sentinels_from_plan(working_input, input_size, &ref_plan8, plan_dhs, 6);
+                    for (int pi = 0; pi < np && n_uniq < 16; pi++) {
+                        int pdh = plan_dhs[pi];
+                        if (pdh == raw_est_dh) continue;
+                        int dup = 0;
+                        for (int k = 0; k < n_uniq; k++) if (uniq_dhs[k] == pdh) dup = 1;
+                        if (!dup) uniq_dhs[n_uniq++] = pdh;
+                    }
+                    free(ref_plan8.tokens);
+                }
                 int lit_bits_cached = detect_buffer_literal_bits(working_input, input_size, NULL);
                 #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
                 for (int ui = 0; ui < n_uniq; ui++) {
@@ -3929,8 +4077,21 @@ uint8_t *ultra_compress_buffer(
                 if (best_meta.dh_sentinel == 0) {
                     best_meta.dh_sentinel = est_dh;
                 }
-                int uniq_ref_dhs[12];
+                int uniq_ref_dhs[16];
                 int n_ref_dhs = rank_top_dh_sentinels(f_cur, input_size, est_dh, uniq_ref_dhs, max_dh_cands);
+                ParsePlan f_plan8 = {NULL, 0, 0};
+                if (solve_exact_parse(f_cur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &f_plan8)) {
+                    int plan_dhs[6];
+                    int np = rank_top_dh_sentinels_from_plan(f_cur, input_size, &f_plan8, plan_dhs, 6);
+                    for (int pi = 0; pi < np && n_ref_dhs < 16; pi++) {
+                        int pdh = plan_dhs[pi];
+                        if (pdh == est_dh) continue;
+                        int dup = 0;
+                        for (int k = 0; k < n_ref_dhs; k++) if (uniq_ref_dhs[k] == pdh) dup = 1;
+                        if (!dup) uniq_ref_dhs[n_ref_dhs++] = pdh;
+                    }
+                    free(f_plan8.tokens);
+                }
                 int f_lit_bits = detect_buffer_literal_bits(f_cur, input_size, NULL);
                 UltraMetadata base_win_meta = best_meta;
                 #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
