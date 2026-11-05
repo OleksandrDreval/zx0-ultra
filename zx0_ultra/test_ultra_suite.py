@@ -406,6 +406,9 @@ def main() -> None:
         dec_hybrid_104 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_hybrid_104b.asm"), os.path.join(tmpdir, "dh104.bin")
         )
+        dec_pro_109 = assemble_flat_binary(
+            os.path.join(ASM_DIR, "unzx0_pro_109b.asm"), os.path.join(tmpdir, "dp109.bin")
+        )
         dec_pro_110 = assemble_flat_binary(
             os.path.join(ASM_DIR, "unzx0_pro_110b.asm"), os.path.join(tmpdir, "dp110.bin")
         )
@@ -430,6 +433,7 @@ def main() -> None:
         print(f"  zx0_ultra/asm/unzx0_univ_93b.asm : {len(dec_univ_93):3d} bytes ({len(dec_univ_93)-70:+d}B vs 70B, 0B-ovh ZX0 compat + Stride + E8)")
         print(f"  zx0_ultra/asm/unzx0_hybrid_102b.asm: {len(dec_hybrid_102):3d} bytes ({len(dec_hybrid_102)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride 1..128, -2B vs 104B)")
         print(f"  zx0_ultra/asm/unzx0_hybrid_104b.asm: {len(dec_hybrid_104):3d} bytes ({len(dec_hybrid_104)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + Free-BX 2D Stride)")
+        print(f"  zx0_ultra/asm/unzx0_pro_109b.asm : {len(dec_pro_109):3d} bytes ({len(dec_pro_109)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride, -2B vs 111B)")
         print(f"  zx0_ultra/asm/unzx0_pro_110b.asm : {len(dec_pro_110):3d} bytes ({len(dec_pro_110)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride, -1B vs 111B)")
         print(f"  zx0_ultra/asm/unzx0_pro_111b.asm : {len(dec_pro_111):3d} bytes ({len(dec_pro_111)-70:+d}B vs 70B, 0B-ovh ZX0 + E8/E9 + 16b/8b 2D Stride)")
         print(f"  zx0_ultra/asm/unzx0_ultra_128b.asm: {len(dec_ultra_128):3d} bytes ({len(dec_ultra_128)-70:+d}B vs 70B, Centered Split-Domain DH=1..127 + E8/E9 + 16b/8b 2D Stride)")
@@ -445,6 +449,7 @@ def main() -> None:
         assert len(dec_univ_93) == 93
         assert len(dec_hybrid_102) == 102
         assert len(dec_hybrid_104) == 104
+        assert len(dec_pro_109) == 109
         assert len(dec_pro_110) == 110
         assert len(dec_pro_111) == 111
         assert len(dec_ultra_128) == 128, f"unzx0_ultra_128b.asm must be exactly 128B (got {len(dec_ultra_128)}B)"
@@ -476,7 +481,7 @@ def main() -> None:
                 expected_hash = sha256_hex(raw)
                 local_checks = 0
 
-                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, 102B/104B-hybrid, AND 110B/111B-pro!)
+                # 1. Upstream Einar Saukas zx0 (verified on 67B, 82B-compat, 84B-x86e8, 93B-univ, 102B/104B-hybrid, AND 109B/110B/111B-pro!)
                 orig_out = os.path.join(tmpdir, f"{name}.orig.zx0")
                 subprocess.run(
                     [ZX0_ORIG_EXE, "-f", in_p, orig_out],
@@ -491,11 +496,12 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_102, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_orig, len(raw))) == expected_hash
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_109, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_110, c_orig, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_orig, len(raw))) == expected_hash
-                local_checks += 8
+                local_checks += 9
 
-                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_102b, hybrid_104b, pro_110b, pro_111b)
+                # 2. ZX0-Ultra --zx0 (verified on unzx0_x86.asm, 67b, compat_82b, x86e8_84b, univ_93b, hybrid_102b, hybrid_104b, pro_109b, pro_110b, pro_111b)
                 u_zx0_p = os.path.join(tmpdir, f"{name}.uzx0")
                 subprocess.run([ZX0_ULTRA_EXE, "--zx0", in_p, u_zx0_p], check=True, stdout=subprocess.DEVNULL)
                 c_uzx0 = open(u_zx0_p, "rb").read()
@@ -506,9 +512,10 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_univ_93, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_102, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_uzx0, len(raw))) == expected_hash
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_109, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_110, c_uzx0, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_uzx0, len(raw))) == expected_hash
-                local_checks += 9
+                local_checks += 10
 
                 # 3. ZX0-Ultra --adpk77 (verified on 77B unzx0_adpk_77b.asm AND 78B unzx0_adpk_78b.asm, k=1..12)
                 u_k78_p = os.path.join(tmpdir, f"{name}.k78")
@@ -561,13 +568,14 @@ def main() -> None:
                 assert sha256_hex(emulate_x86_decompressor(dec_hybrid_104, c_h108, len(raw))) == expected_hash
                 local_checks += 2
 
-                # 10. ZX0-Ultra --pro111 (verified on 110B unzx0_pro_110b.asm AND 111B unzx0_pro_111b.asm)
+                # 10. ZX0-Ultra --pro111 (verified on 109B unzx0_pro_109b.asm, 110B unzx0_pro_110b.asm, AND 111B unzx0_pro_111b.asm)
                 u_p111_p = os.path.join(tmpdir, f"{name}.p111")
                 subprocess.run([ZX0_ULTRA_EXE, "--pro111", in_p, u_p111_p], check=True, stdout=subprocess.DEVNULL)
                 c_p111 = open(u_p111_p, "rb").read()
+                assert sha256_hex(emulate_x86_decompressor(dec_pro_109, c_p111, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_110, c_p111, len(raw))) == expected_hash
                 assert sha256_hex(emulate_x86_decompressor(dec_pro_111, c_p111, len(raw))) == expected_hash
-                local_checks += 2
+                local_checks += 3
 
                 # 11. ZX0-Ultra --ultra128 (verified on 128B unzx0_ultra_128b.asm & C CLI decompressor)
                 u_u128_p = os.path.join(tmpdir, f"{name}.u128")
