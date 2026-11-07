@@ -5,6 +5,12 @@
 *.lst
 *.pyc
 
+*.zx0
+*.zx0u
+
 *.png
 
 *.md
+*.txt
+
+datasets
