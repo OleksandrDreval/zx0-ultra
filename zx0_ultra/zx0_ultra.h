@@ -44,9 +44,11 @@ typedef enum {
     ULTRA_FORMAT_X86E8_84B   = 5, /* 84-byte Zero-Overhead ZX0-compatible + x86 E8 Call-Target filter */
     ULTRA_FORMAT_UNIV_93B    = 6, /* 93-byte Universal Zero-Overhead ZX0 + Stride-Delta + x86 E8 filter */
     ULTRA_FORMAT_HYBRID_108B = 7, /* 108-byte Multi-Stage Hybrid 0B-Ovh ZX0 + E8/E9 + Free-BX 2D Stride */
-    ULTRA_FORMAT_ULTRA_128B  = 8, /* 128-byte Flagship Split-Range Variable-Bit Literals + E8/E9 + 16b/8b 2D Stride */
-    ULTRA_FORMAT_PRO_111B    = 9  /* 111-byte Zero-Overhead ZX0 + E8/E9 + 16-Bit/8-Bit 2D Stride */
+    ULTRA_FORMAT_ULTRA_128B  = 8, /* 127B/128B Flagship Split-Range Variable-Bit Literals + E8/E9 + 16b/8b 2D Stride */
+    ULTRA_FORMAT_PRO_111B    = 9  /* 106B..111B Zero-Overhead ZX0 + E8/E9 + 16-Bit/8-Bit 2D Stride */
 } UltraFormat;
+
+extern int g_single_e8_only;
 
 typedef struct {
     UltraFormat format;
