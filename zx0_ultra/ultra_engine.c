@@ -212,9 +212,24 @@ static inline void frontier_push(MonotonicFrontier *frontier, int pos, int base_
     while (c > 0 && frontier->entries[c - 1].base_cost >= base_cost) {
         c--;
     }
+    if (c >= 2) {
+        int out = 1;
+        for (int k = 1; k < c; k++) {
+            int pa = frontier->entries[out - 1].pos;
+            int pb = frontier->entries[k].pos;
+            int da = (pos + 1) - pa;
+            int db = (pos + 1) - pb;
+            if (db >= (pb - pa) && (frontier->entries[k].base_cost - frontier->entries[out - 1].base_cost) >= 2 &&
+                (da < (db << 1))) {
+                continue;
+            }
+            frontier->entries[out++] = frontier->entries[k];
+        }
+        c = out;
+    }
     frontier->count = c;
     if (c > 0) {
-        if ((base_cost - frontier->entries[0].base_cost) > 32) {
+        if ((base_cost - frontier->entries[0].base_cost) > 64) {
             return;
         }
         int last_delta = pos - frontier->entries[c - 1].pos;
@@ -227,6 +242,10 @@ static inline void frontier_push(MonotonicFrontier *frontier, int pos, int base_
         frontier->entries[c].base_cost = base_cost;
         frontier->entries[c].node_idx = node_idx;
         frontier->count = c + 1;
+    } else {
+        frontier->entries[EXACT_FRONTIER_CAPACITY - 1].pos = pos;
+        frontier->entries[EXACT_FRONTIER_CAPACITY - 1].base_cost = base_cost;
+        frontier->entries[EXACT_FRONTIER_CAPACITY - 1].node_idx = node_idx;
     }
 }
 
@@ -317,6 +336,13 @@ static void build_dh_spec(int dh, DhSpec *spec) {
 }
 
 typedef struct {
+    int lit_min_base;
+    int lit_max_pos;
+    int rep_valid_pos;
+    int new_off_overhead;
+} OffsetState;
+
+typedef struct {
     int cap_n;
     int cap_w;
     NodePool pool;
@@ -333,10 +359,17 @@ typedef struct {
     int blk1024_cost[64];
     int blk1024_pos[64];
     int lit_blk64_min[1024];
+    uint64_t lit_act64[1024];
+    int lit_blk8_min[4096];
+    OffsetState *off_state;
     MonotonicFrontier *lit_frontiers;
     MonotonicFrontier *rep_frontiers;
     int *lit_min_base;
     int *lit_max_pos;
+    int *lit_node0;
+    int *rep_pos0;
+    int *rep_cost0;
+    int *rep_node0;
     int *new_off_overhead;
     int *match_lengths;
     int *last_match_pos;
@@ -352,6 +385,7 @@ typedef struct {
 
 static _Thread_local DpWorkspace tls_dp = {0};
 static int g_deep_mode = 1;
+static _Thread_local int tls_deep_mode = -1;
 
 static void dp_workspace_ensure(DpWorkspace *ws, int n, int w) {
     if (n + 1 > ws->cap_n) {
@@ -368,16 +402,21 @@ static void dp_workspace_ensure(DpWorkspace *ws, int n, int w) {
                ws->best_any_cost && ws->best_any_node && ws->best_len_cost && ws->best_len_start);
         ws->cap_n = new_n;
     }
-    if (w + 1 > ws->cap_w) {
-        int new_w = (w + 1) > 4096 ? (w + 1) : 4096;
+    if (w + 64 > ws->cap_w) {
+        int new_w = (w + 64) > 4096 ? (w + 64) : 4096;
         ws->lit_frontiers    = (MonotonicFrontier *)realloc(ws->lit_frontiers,   (size_t)new_w * sizeof(MonotonicFrontier));
         ws->rep_frontiers    = (MonotonicFrontier *)realloc(ws->rep_frontiers,   (size_t)new_w * sizeof(MonotonicFrontier));
         ws->lit_min_base     = (int *)realloc(ws->lit_min_base,     (size_t)new_w * sizeof(int));
         ws->lit_max_pos      = (int *)realloc(ws->lit_max_pos,      (size_t)new_w * sizeof(int));
+        ws->lit_node0        = (int *)realloc(ws->lit_node0,        (size_t)new_w * sizeof(int));
+        ws->rep_pos0         = (int *)realloc(ws->rep_pos0,         (size_t)new_w * sizeof(int));
+        ws->rep_cost0        = (int *)realloc(ws->rep_cost0,        (size_t)new_w * sizeof(int));
+        ws->rep_node0        = (int *)realloc(ws->rep_node0,        (size_t)new_w * sizeof(int));
         ws->new_off_overhead = (int *)realloc(ws->new_off_overhead, (size_t)new_w * sizeof(int));
         ws->match_lengths    = (int *)realloc(ws->match_lengths,    (size_t)new_w * sizeof(int));
         ws->last_match_pos   = (int *)realloc(ws->last_match_pos,   (size_t)new_w * sizeof(int));
         ws->rep_valid_pos    = (int *)realloc(ws->rep_valid_pos,    (size_t)new_w * sizeof(int));
+        ws->off_state        = (OffsetState *)realloc(ws->off_state, (size_t)new_w * sizeof(OffsetState));
         ws->final_lit_cost   = (int *)realloc(ws->final_lit_cost,   (size_t)new_w * sizeof(int));
         ws->final_lit_node   = (int *)realloc(ws->final_lit_node,   (size_t)new_w * sizeof(int));
         ws->final_mat_cost   = (int *)realloc(ws->final_mat_cost,   (size_t)new_w * sizeof(int));
@@ -689,8 +728,6 @@ static int rank_top_dh_sentinels(
     int cand_dh_lit[128];
     int cand_score_lit[128];
     int n_cand = 0;
-    int ref3_w = input_size * 8;
-    int ref3_l = (lit_count >= 4 ? lit_count : input_size) * 8;
     DhSpec spec;
     for (int dh = 3; dh <= 127; dh++) {
         if (dh == exclude_dh) {
@@ -712,9 +749,7 @@ static int rank_top_dh_sentinels(
             }
         }
         if (ok) {
-            if (input_size >= 8192 && dh != 3 && sum_l >= ref3_l - 16 && sum_w >= ref3_w - 16) {
-                continue;
-            }
+            
             cand_dh[n_cand] = dh;
             cand_score_whole[n_cand] = sum_w;
             cand_dh_lit[n_cand] = dh;
@@ -1167,6 +1202,229 @@ static inline int compute_exact_ml_run_eq(
     return acc;
 }
 
+static __attribute__((noinline)) void eval_1b_swar_tail(
+    DpWorkspace *ws,
+    const uint8_t *input_data,
+    int input_size,
+    int pos,
+    int off_start,
+    int active_max_off,
+    uint8_t cur_byte,
+    uint8_t prv_byte,
+    uint8_t nxt_byte,
+    int max_any_raw_1b,
+    int prev_lit_bits,
+    int literal_pos_bits,
+    int cur_pad_1b,
+    int f_pad,
+    int need_tokens,
+    int *best_any_cost,
+    int *best_any_node,
+    int *best_mat_cost_at_pos,
+    int *best_mat_node_at_pos
+) {
+    OffsetState *os = ws->off_state;
+    MonotonicFrontier *lit_frontiers = ws->lit_frontiers;
+    int *lit_node0 = ws->lit_node0;
+    int *match_lengths = ws->match_lengths;
+    int *last_match_pos = ws->last_match_pos;
+    NodePool *pool = &ws->pool;
+    uint64_t mul_cur = 0x0101010101010101ULL * (uint64_t)cur_byte;
+    uint64_t mul_prv = 0x0101010101010101ULL * (uint64_t)prv_byte;
+    uint64_t m7f = 0x7F7F7F7F7F7F7F7FULL;
+    int start_b64 = off_start >> 6;
+    int max_b64 = active_max_off >> 6;
+    int max_b8_all = active_max_off >> 3;
+    for (int b64 = start_b64; b64 <= max_b64; b64++) {
+        if (ws->lit_blk64_min[b64] > max_any_raw_1b) {
+            continue;
+        }
+        uint64_t act64 = ws->lit_act64[b64];
+        if (!act64) continue;
+        int b8_lo = (b64 == start_b64) ? (off_start >> 3) : (b64 << 3);
+        int b8_hi = (b64 << 3) | 7;
+        if (b8_hi > max_b8_all) b8_hi = max_b8_all;
+        for (int b8 = b8_lo; b8 <= b8_hi; b8++) {
+            if (ws->lit_blk8_min[b8] > max_any_raw_1b) continue;
+            int idx_lo = (pos - 1) - ((b8 << 3) | 7);
+            if (idx_lo >= 1 && b8 > 0) {
+                uint64_t w_cur, w_prv;
+                memcpy(&w_cur, input_data + idx_lo, 8);
+                memcpy(&w_prv, input_data + idx_lo - 1, 8);
+                uint64_t x_cur = w_cur ^ mul_cur;
+                uint64_t z_cur = ~((((x_cur & m7f) + m7f) | x_cur) | m7f);
+                if (!z_cur) continue;
+                uint64_t x_prv = w_prv ^ mul_prv;
+                uint64_t z_prv = ~((((x_prv & m7f) + m7f) | x_prv) | m7f);
+                uint64_t mask = z_cur & ~z_prv;
+                if (b8 == (off_start >> 3)) {
+                    mask &= (0xFFFFFFFFFFFFFFFFULL >> ((off_start & 7) << 3));
+                }
+                while (mask) {
+                    int lz = __builtin_clzll(mask) >> 3;
+                    mask ^= (0x8000000000000000ULL >> (lz << 3));
+                    int off = (b8 << 3) + lz;
+                    int min_base = os[off].lit_min_base;
+                    if (min_base > max_any_raw_1b) continue;
+                    int raw_max_p = os[off].lit_max_pos;
+                    int max_p = raw_max_p & 0xFFFFF;
+                    if (max_p >= pos - 1) continue;
+                    int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
+                    int max_viable_mat = (best_any_cost[pos] < COST_INFINITY)
+                                       ? (can_enter_lit ? (best_any_cost[pos] + os[off].new_off_overhead + cur_pad_1b) : (best_any_cost[pos] - 1))
+                                       : COST_INFINITY;
+                    if (min_base + 4 + prev_lit_bits > max_viable_mat) continue;
+                    int min_elias = compute_elias_gamma_bits((pos - 1) - max_p);
+                    if (min_base + 1 + min_elias + prev_lit_bits + 2 > max_viable_mat) continue;
+                    int lit_src_node = -1;
+                    int raw_eval = !(raw_max_p & (1 << 20))
+                                 ? (min_base + 1 + min_elias)
+                                 : frontier_evaluate_min(&lit_frontiers[off], pos - 1, &lit_src_node);
+                    if (raw_eval < COST_INFINITY) {
+                        int lit_cost_m = raw_eval + prev_lit_bits;
+                        int rep_cost = lit_cost_m + 2;
+                        if (rep_cost <= max_viable_mat) {
+                            int mat_base_cost = rep_cost - literal_pos_bits;
+                            int enters_lit_frontier = can_enter_lit && ((mat_base_cost - min_base) <= f_pad);
+                            if (rep_cost < best_any_cost[pos] || enters_lit_frontier) {
+                                if (need_tokens && !(raw_max_p & (1 << 20))) lit_src_node = lit_node0[off];
+                                int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos - 1, 0) : 0;
+                                int created_mat_node = need_tokens ? node_pool_push(pool, created_lit_node, pos, off) : 0;
+                                match_lengths[off] = 1;
+                                last_match_pos[off] = pos;
+                                if (rep_cost < best_any_cost[pos]) {
+                                    best_any_cost[pos] = rep_cost;
+                                    best_any_node[pos] = created_mat_node;
+                                }
+                                if (rep_cost < *best_mat_cost_at_pos) {
+                                    *best_mat_cost_at_pos = rep_cost;
+                                    *best_mat_node_at_pos = created_mat_node;
+                                }
+                                if (enters_lit_frontier) {
+                                    if (min_base == COST_INFINITY || mat_base_cost <= min_base) {
+                                        os[off].lit_min_base = mat_base_cost;
+                                        os[off].lit_max_pos = pos;
+                                        lit_node0[off] = created_mat_node;
+                                        ws->lit_act64[off >> 6] |= (1ULL << (off & 63));
+                                        if (mat_base_cost < ws->lit_blk64_min[off >> 6]) { ws->lit_blk64_min[off >> 6] = mat_base_cost; }
+                                        if (mat_base_cost < ws->lit_blk8_min[off >> 3]) { ws->lit_blk8_min[off >> 3] = mat_base_cost; }
+                                    } else if ((mat_base_cost - min_base) <= 64) {
+                                        int raw_mp = os[off].lit_max_pos;
+                                        if (!(raw_mp & (1 << 20))) {
+                                            int last_delta = pos - raw_mp;
+                                            if (mat_base_cost - min_base < compute_elias_gamma_bits(last_delta + 1) - 1) {
+                                                lit_frontiers[off].count = 2;
+                                                lit_frontiers[off].entries[0].pos = raw_mp;
+                                                lit_frontiers[off].entries[0].base_cost = min_base;
+                                                lit_frontiers[off].entries[0].node_idx = lit_node0[off];
+                                                lit_frontiers[off].entries[1].pos = pos;
+                                                lit_frontiers[off].entries[1].base_cost = mat_base_cost;
+                                                lit_frontiers[off].entries[1].node_idx = created_mat_node;
+                                                os[off].lit_max_pos = pos | (1 << 20);
+                                            }
+                                        } else {
+                                            frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
+                                            int new_mb = lit_frontiers[off].entries[0].base_cost;
+                                            os[off].lit_min_base = new_mb;
+                                            lit_node0[off] = lit_frontiers[off].entries[0].node_idx;
+                                            if (new_mb < ws->lit_blk64_min[off >> 6]) { ws->lit_blk64_min[off >> 6] = new_mb; }
+                                            if (new_mb < ws->lit_blk8_min[off >> 3]) { ws->lit_blk8_min[off >> 3] = new_mb; }
+                                            int fc = lit_frontiers[off].count;
+                                            int fp = lit_frontiers[off].entries[fc - 1].pos;
+                                            os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                int off_lo = (b8 << 3) > off_start ? (b8 << 3) : off_start;
+                int off_hi = ((b8 << 3) | 7) < active_max_off ? ((b8 << 3) | 7) : active_max_off;
+                for (int off = off_lo; off <= off_hi; off++) {
+                    int min_base = os[off].lit_min_base;
+                    if (min_base > max_any_raw_1b) continue;
+                    int cur_idx1b = (pos - 1) - off;
+                    if (input_data[cur_idx1b] != cur_byte) continue;
+                    int raw_max_p = os[off].lit_max_pos;
+                    int max_p = raw_max_p & 0xFFFFF;
+                    if (max_p >= pos - 1 || (cur_idx1b > 0 && input_data[cur_idx1b - 1] == prv_byte)) continue;
+                    int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
+                    int max_viable_mat = (best_any_cost[pos] < COST_INFINITY)
+                                       ? (can_enter_lit ? (best_any_cost[pos] + os[off].new_off_overhead + cur_pad_1b) : (best_any_cost[pos] - 1))
+                                       : COST_INFINITY;
+                    if (min_base + 4 + prev_lit_bits > max_viable_mat) continue;
+                    int min_elias = compute_elias_gamma_bits((pos - 1) - max_p);
+                    if (min_base + 1 + min_elias + prev_lit_bits + 2 > max_viable_mat) continue;
+                    int lit_src_node = -1;
+                    int raw_eval = !(raw_max_p & (1 << 20))
+                                 ? (min_base + 1 + min_elias)
+                                 : frontier_evaluate_min(&lit_frontiers[off], pos - 1, &lit_src_node);
+                    if (raw_eval < COST_INFINITY) {
+                        int lit_cost_m = raw_eval + prev_lit_bits;
+                        int rep_cost = lit_cost_m + 2;
+                        if (rep_cost <= max_viable_mat) {
+                            int mat_base_cost = rep_cost - literal_pos_bits;
+                            int enters_lit_frontier = can_enter_lit && ((mat_base_cost - min_base) <= f_pad);
+                            if (rep_cost < best_any_cost[pos] || enters_lit_frontier) {
+                                if (need_tokens && !(raw_max_p & (1 << 20))) lit_src_node = lit_node0[off];
+                                int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos - 1, 0) : 0;
+                                int created_mat_node = need_tokens ? node_pool_push(pool, created_lit_node, pos, off) : 0;
+                                match_lengths[off] = 1;
+                                last_match_pos[off] = pos;
+                                if (rep_cost < best_any_cost[pos]) {
+                                    best_any_cost[pos] = rep_cost;
+                                    best_any_node[pos] = created_mat_node;
+                                }
+                                if (rep_cost < *best_mat_cost_at_pos) {
+                                    *best_mat_cost_at_pos = rep_cost;
+                                    *best_mat_node_at_pos = created_mat_node;
+                                }
+                                if (enters_lit_frontier) {
+                                    if (min_base == COST_INFINITY || mat_base_cost <= min_base) {
+                                        os[off].lit_min_base = mat_base_cost;
+                                        os[off].lit_max_pos = pos;
+                                        lit_node0[off] = created_mat_node;
+                                        ws->lit_act64[off >> 6] |= (1ULL << (off & 63));
+                                        if (mat_base_cost < ws->lit_blk64_min[off >> 6]) { ws->lit_blk64_min[off >> 6] = mat_base_cost; }
+                                        if (mat_base_cost < ws->lit_blk8_min[off >> 3]) { ws->lit_blk8_min[off >> 3] = mat_base_cost; }
+                                    } else if ((mat_base_cost - min_base) <= 64) {
+                                        int raw_mp = os[off].lit_max_pos;
+                                        if (!(raw_mp & (1 << 20))) {
+                                            int last_delta = pos - raw_mp;
+                                            if (mat_base_cost - min_base < compute_elias_gamma_bits(last_delta + 1) - 1) {
+                                                lit_frontiers[off].count = 2;
+                                                lit_frontiers[off].entries[0].pos = raw_mp;
+                                                lit_frontiers[off].entries[0].base_cost = min_base;
+                                                lit_frontiers[off].entries[0].node_idx = lit_node0[off];
+                                                lit_frontiers[off].entries[1].pos = pos;
+                                                lit_frontiers[off].entries[1].base_cost = mat_base_cost;
+                                                lit_frontiers[off].entries[1].node_idx = created_mat_node;
+                                                os[off].lit_max_pos = pos | (1 << 20);
+                                            }
+                                        } else {
+                                            frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
+                                            int new_mb = lit_frontiers[off].entries[0].base_cost;
+                                            os[off].lit_min_base = new_mb;
+                                            lit_node0[off] = lit_frontiers[off].entries[0].node_idx;
+                                            if (new_mb < ws->lit_blk64_min[off >> 6]) { ws->lit_blk64_min[off >> 6] = new_mb; }
+                                            if (new_mb < ws->lit_blk8_min[off >> 3]) { ws->lit_blk8_min[off >> 3] = new_mb; }
+                                            int fc = lit_frontiers[off].count;
+                                            int fp = lit_frontiers[off].entries[fc - 1].pos;
+                                            os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static int solve_exact_parse(
     const uint8_t *input_data,
     int input_size,
@@ -1217,10 +1475,15 @@ static int solve_exact_parse(
     MonotonicFrontier *rep_frontiers = ws->rep_frontiers;
     int *lit_min_base     = ws->lit_min_base;
     int *lit_max_pos      = ws->lit_max_pos;
+    int *lit_node0        = ws->lit_node0;
+    int *rep_pos0         = ws->rep_pos0;
+    int *rep_cost0        = ws->rep_cost0;
+    int *rep_node0        = ws->rep_node0;
     int *new_off_overhead = ws->new_off_overhead;
     int *match_lengths    = ws->match_lengths;
     int *last_match_pos   = ws->last_match_pos;
-    int *rep_valid_pos    = ws->rep_valid_pos;
+    int *rep_valid_pos    = ws->rep_valid_pos; (void)lit_min_base; (void)lit_max_pos; (void)new_off_overhead; (void)rep_valid_pos;
+    OffsetState *os = ws->off_state;
     int *final_lit_cost   = ws->final_lit_cost;
     int *final_lit_node   = ws->final_lit_node;
     int *final_mat_cost   = ws->final_mat_cost;
@@ -1270,19 +1533,19 @@ static int solve_exact_parse(
         }
     }
 
-    new_off_overhead[0] = 0;
+    os[0].new_off_overhead = 0;
     lit_frontiers[0].count = 0;
     rep_frontiers[0].count = 0;
     if (wildcard_mask == NULL) {
         for (int off = 1; off <= max_window; off++) {
-            new_off_overhead[off] = compute_new_offset_overhead_bits(off, offset_lsb_bits);
+            os[off].new_off_overhead = compute_new_offset_overhead_bits(off, offset_lsb_bits);
         }
         for (int off = 0; off <= max_window; off++) {
-            lit_min_base[off] = COST_INFINITY;
-            lit_max_pos[off] = 0;
+            os[off].lit_min_base = COST_INFINITY;
+            os[off].lit_max_pos = 0;
             match_lengths[off] = 0;
             last_match_pos[off] = 0;
-            rep_valid_pos[off] = -1;
+            os[off].rep_valid_pos = -1;
         }
         if (required_final_offset > 0 || req_bh_ff) {
             for (int off = 0; off <= max_window; off++) {
@@ -1295,15 +1558,15 @@ static int solve_exact_parse(
     } else {
         for (int off = 0; off <= max_window; off++) {
             if (off >= 1) {
-                new_off_overhead[off] = compute_new_offset_overhead_bits(off, offset_lsb_bits);
+                os[off].new_off_overhead = compute_new_offset_overhead_bits(off, offset_lsb_bits);
             }
             lit_frontiers[off].count = 0;
             rep_frontiers[off].count = 0;
-            lit_min_base[off] = COST_INFINITY;
-            lit_max_pos[off] = 0;
+            os[off].lit_min_base = COST_INFINITY;
+            os[off].lit_max_pos = 0;
             match_lengths[off] = 0;
             last_match_pos[off] = 0;
-            rep_valid_pos[off] = -1;
+            os[off].rep_valid_pos = -1;
             final_lit_cost[off] = COST_INFINITY;
             final_lit_node[off] = -1;
             final_mat_cost[off] = COST_INFINITY;
@@ -1314,6 +1577,14 @@ static int solve_exact_parse(
     int num_blk64 = (max_window >> 6) + 2;
     for (int b = 0; b < num_blk64 && b < 1024; b++) {
         ws->lit_blk64_min[b] = COST_INFINITY;
+        ws->lit_act64[b] = 0;
+    }
+    int deep_init = (tls_deep_mode >= 0) ? tls_deep_mode : g_deep_mode;
+    if (deep_init == 1 || deep_init == 3) {
+        int num_blk8 = (max_window >> 3) + 2;
+        for (int b8 = 0; b8 < num_blk8 && b8 < 4096; b8++) {
+            ws->lit_blk8_min[b8] = COST_INFINITY;
+        }
     }
 
     int need_tokens = (plan_out != NULL);
@@ -1323,13 +1594,16 @@ static int solve_exact_parse(
     if (dh_mode == 0) {
         lit_frontiers[ZX0_INITIAL_OFFSET].count = 0;
         frontier_push(&lit_frontiers[ZX0_INITIAL_OFFSET], 0, -1, -1);
-        lit_min_base[ZX0_INITIAL_OFFSET] = -1;
-        lit_max_pos[ZX0_INITIAL_OFFSET] = 0;
+        os[ZX0_INITIAL_OFFSET].lit_min_base = -1;
+        os[ZX0_INITIAL_OFFSET].lit_max_pos = 0;
+        lit_node0[ZX0_INITIAL_OFFSET] = -1;
     }
     frontier_push(&lit_frontiers[0], 0, -1, -1);
-    lit_min_base[0] = -1;
-    lit_max_pos[0] = 0;
+    os[0].lit_min_base = -1;
+    os[0].lit_max_pos = 0;
     ws->lit_blk64_min[0] = -1;
+    ws->lit_act64[0] = 1ULL;
+    ws->lit_blk8_min[0] = -1;
     best_any_cost[0] = COST_INFINITY;
     best_any_node[0] = -1;
     ws->blk64_cost[0] = COST_INFINITY;
@@ -1339,9 +1613,46 @@ static int solve_exact_parse(
 
     for (int pos = 1; pos <= input_size; pos++) {
         if (__builtin_expect(need_tokens && pool->count >= gc_threshold, 0)) {
+            if (wildcard_mask == NULL) {
+                ws->lit_min_base[0] = os[0].lit_min_base;
+                ws->rep_valid_pos[0] = -1;
+                for (int o = 1; o <= max_window; o++) {
+                    ws->lit_min_base[o] = os[o].lit_min_base;
+                    ws->rep_valid_pos[o] = os[o].rep_valid_pos;
+                    if (os[o].lit_min_base < COST_INFINITY && !(os[o].lit_max_pos & (1 << 20))) {
+                        lit_frontiers[o].count = 1;
+                        lit_frontiers[o].entries[0].pos = os[o].lit_max_pos;
+                        lit_frontiers[o].entries[0].base_cost = os[o].lit_min_base;
+                        lit_frontiers[o].entries[0].node_idx = lit_node0[o];
+                    }
+                    if (os[o].rep_valid_pos >= 0 && (os[o].rep_valid_pos & (1 << 20))) {
+                        rep_frontiers[o].count = 1;
+                        rep_frontiers[o].entries[0].pos = rep_pos0[o];
+                        rep_frontiers[o].entries[0].base_cost = rep_cost0[o];
+                        rep_frontiers[o].entries[0].node_idx = rep_node0[o];
+                    } else {
+                        rep_frontiers[o].count = 0;
+                    }
+                }
+            } else {
+                for (int o = 0; o <= max_window; o++) {
+                    ws->lit_min_base[o] = os[o].lit_min_base;
+                    ws->rep_valid_pos[o] = os[o].rep_valid_pos;
+                }
+            }
             node_pool_compact(
                 pool, best_any_node, pos - 1, lit_frontiers, lit_min_base, rep_frontiers, rep_valid_pos, max_window
             );
+            if (wildcard_mask == NULL) {
+                for (int o = 1; o <= max_window; o++) {
+                    if (os[o].lit_min_base < COST_INFINITY) {
+                        lit_node0[o] = lit_frontiers[o].entries[0].node_idx;
+                    }
+                    if (os[o].rep_valid_pos >= 0 && (os[o].rep_valid_pos & (1 << 20))) {
+                        rep_node0[o] = rep_frontiers[o].entries[0].node_idx;
+                    }
+                }
+            }
             if (pool->count * 2 > gc_threshold) {
                 gc_threshold = pool->count * 2;
             }
@@ -1395,19 +1706,24 @@ static int solve_exact_parse(
             uint8_t prv_byte = (pos >= 2) ? input_data[pos - 2] : 0;
             int cur_continues = (pos < input_size && nxt_byte == cur_byte);
 
-            int deep = (input_size < 8192) || g_deep_mode;
+            int deep = (tls_deep_mode >= 0) ? tls_deep_mode : g_deep_mode;
             int chain_steps = 0;
             int match_steps = 0;
             int max_seen_ml = 1;
-            int max_chain_steps = deep ? (input_size < 8192 ? 32640 : 3072) : 16;
-            int max_match_steps = deep ? (input_size < 8192 ? 8192 : 768) : 8;
-            int mat_pad = deep ? (input_size < 8192 ? 64 : ((pos >= 64 && best_any_cost[pos] > (pos << 2)) ? 40 : 12)) : 4;
-            int f_pad = (pos >= 64 && best_any_cost[pos] > (pos << 2)) ? 40 : 16;
+            int max_chain_steps = (deep == 3) ? 32640 : ((deep == 2) ? (input_size <= 8192 ? 128 : 64) : (deep ? (input_size < 8192 ? 32640 : 4096) : (input_size <= 1024 ? 128 : 16)));
+            int max_match_steps = (deep == 3) ? 8192 : ((deep == 2) ? (input_size <= 8192 ? 32 : 24) : (deep ? (input_size < 8192 ? 8192 : 1024) : (input_size <= 1024 ? 32 : 8)));
+            int is_incomp = (dh_mode == 0 && pos >= 64 && best_any_cost[pos] > pos * 3);
+            int mat_pad = (deep == 1) ? ((input_size < 8192 || is_incomp) ? 64 : 12) : (deep ? 12 : 4);
+            int f_pad = (deep == 1) ? ((input_size < 8192 || is_incomp) ? 128 : 16) : 16;
 
             int idx1 = (pos >= 2) ? prev_same_pair[pos - 1] : -1;
             int min_pair_idx1 = min_idx1 > 1 ? min_idx1 : 1;
             int switched_to_L0 = 0;
-            int dh_win_limit = (dh_mode != 0 && deep) ? (!req_bh_ff ? 2176 : 0) : 0;
+            int dh_win_limit = 0;
+            uint8_t b_m3 = (pos >= 3) ? input_data[pos - 3] : 0;
+            int max_mb_m2 = (pos >= 2 && best_any_cost[pos - 2] < COST_INFINITY)
+                          ? (best_any_cost[pos - 2] - lit_cum_bits[pos - 2] + os[loop_max_off].new_off_overhead - 3)
+                          : COST_INFINITY;
 
             while (idx1 >= min_pair_idx1) {
                 if (++chain_steps > max_chain_steps) {
@@ -1419,9 +1735,68 @@ static int solve_exact_parse(
                     off = (pos - 1) - cur_idx1;
                     idx1 = prev_same_pair[cur_idx1];
 
-                    L1 = run_start[cur_idx1];
-                    run1 = cur_idx1 - L1 + 1;
-                    if (run0 >= 2 && (cur_continues || (input_size >= 8192 && off > 256))) {
+                    if (!(cur_continues && run0 >= 2)) {
+                        if (pos < 3 || cur_idx1 < 2 || input_data[cur_idx1 - 2] != b_m3) {
+                            ml = 2;
+                            if (match_steps >= 1 && off != required_final_offset && !(req_bh_ff && off <= 256)) {
+                                int can_lit_m2 = (pos < input_size && input_data[cur_idx1 + 1] != nxt_byte);
+                                if (!can_lit_m2 || match_steps >= max_match_steps) {
+                                    if (!(ws->lit_act64[off >> 6] & (1ULL << (off & 63))) ||
+                                        os[off].lit_min_base > max_mb_m2) {
+                                        match_steps++;
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else {
+                            if (match_steps >= 1 && off != required_final_offset && !(req_bh_ff && off <= 256) &&
+                                (cur_idx1 < max_seen_ml || input_data[cur_idx1 - max_seen_ml] != input_data[(pos - 1) - max_seen_ml])) {
+                                int can_lit_m3 = (pos < input_size && input_data[cur_idx1 + 1] != nxt_byte);
+                                if (!can_lit_m3) {
+                                    if (!(ws->lit_act64[off >> 6] & (1ULL << (off & 63)))) {
+                                        match_steps++;
+                                        continue;
+                                    }
+                                    if (os[off].rep_valid_pos == pos - 1) {
+                                        os[off].rep_valid_pos = pos;
+                                        match_steps++;
+                                        continue;
+                                    }
+                                } else if (match_steps >= max_match_steps && off > dh_win_limit) {
+                                    if (!(ws->lit_act64[off >> 6] & (1ULL << (off & 63)))) {
+                                        match_steps++;
+                                        continue;
+                                    }
+                                    if (os[off].rep_valid_pos == pos - 1 && (pos - (os[off].lit_max_pos & 0xFFFFF)) > 2048) {
+                                        os[off].rep_valid_pos = pos;
+                                        match_steps++;
+                                        continue;
+                                    }
+                                }
+                            }
+                            uint64_t _w0, _w1, _diff = 0;
+                            if (cur_idx1 >= 9) {
+                                memcpy(&_w0, input_data + pos - 10, 8);
+                                memcpy(&_w1, input_data + cur_idx1 - 9, 8);
+                                _diff = _w0 ^ _w1;
+                            }
+                            if (_diff != 0) {
+                                ml = 2 + (__builtin_clzll(_diff) >> 3);
+                            } else {
+                                L1 = run_start[cur_idx1];
+                                run1 = cur_idx1 - L1 + 1;
+                                if (run1 < run0) {
+                                    ml = run1;
+                                } else if (run1 > run0) {
+                                    ml = run0;
+                                } else {
+                                    ml = compute_exact_ml_run_eq(input_data, run_start, last_match_pos, match_lengths, pos, off, L0, L1, run0);
+                                }
+                            }
+                        }
+                    } else {
+                        L1 = run_start[cur_idx1];
+                        run1 = cur_idx1 - L1 + 1;
                         if (L1 == L0) {
                             if (cur_idx1 < pos - 2) {
                                 idx1 = (L0 + 1 < input_size) ? prev_same_pair[L0 + 1] : -1;
@@ -1432,18 +1807,18 @@ static int solve_exact_parse(
                                 idx1 = target;
                             }
                         }
-                    }
-                    if (run1 < run0) {
-                        ml = run1;
-                    } else if (run1 > run0) {
-                        ml = run0;
-                    } else {
-                        ml = compute_exact_ml_run_eq(input_data, run_start, last_match_pos, match_lengths, pos, off, L0, L1, run0);
+                        if (run1 < run0) {
+                            ml = run1;
+                        } else if (run1 > run0) {
+                            ml = run0;
+                        } else {
+                            ml = compute_exact_ml_run_eq(input_data, run_start, last_match_pos, match_lengths, pos, off, L0, L1, run0);
+                        }
                     }
                     int next_max_ml = (ml > max_seen_ml) ? ml : max_seen_ml;
-                    if (input_size >= 8192 && run0 >= 2 && next_max_ml >= run0 && off > dh_win_limit &&
+                    if ((input_size >= 8192 || deep != 1 || match_steps >= 256) && run0 >= 2 && next_max_ml >= run0 && off > dh_win_limit &&
                         (required_final_offset <= 0 || off > required_final_offset) &&
-                        (cur_continues || match_steps >= max_match_steps)) {
+                        ((cur_continues && (run0 > 8 || match_steps >= 64)) || match_steps >= max_match_steps)) {
                         if (L0 == 0) break;
                         switched_to_L0 = 1;
                         int next_L1 = prev_same_pair[L0];
@@ -1462,86 +1837,108 @@ static int solve_exact_parse(
                         continue;
                     }
                     off = L0 - L1;
-                    if (cur_continues && off > 256 && off != required_final_offset &&
-                        input_data[cur_idx1 + 1] == nxt_byte &&
-                        (lit_min_base[off] == COST_INFINITY || (lit_max_pos[off] & 0xFFFFF) >= L0) &&
-                        (rep_valid_pos[off] < 0 || (rep_valid_pos[off] & (1 << 20)) == 0) &&
-                        (cur_idx1 < max_seen_ml || input_data[cur_idx1 - max_seen_ml] != input_data[(pos - 1) - max_seen_ml])) {
-                        match_steps++;
-                        continue;
+                    if (off > 256 && off != required_final_offset &&
+                        (L0 == 0 || L1 == 0 || input_data[L0 - 1] != input_data[L1 - 1] ||
+                         cur_idx1 < max_seen_ml || input_data[cur_idx1 - max_seen_ml] != input_data[(pos - 1) - max_seen_ml])) {
+                        int can_lit_l0 = (pos < input_size && input_data[cur_idx1 + 1] != nxt_byte);
+                        if (!can_lit_l0) {
+                            if (!(ws->lit_act64[off >> 6] & (1ULL << (off & 63)))) {
+                                match_steps++;
+                                continue;
+                            }
+                            if ((os[off].rep_valid_pos < 0 || !(os[off].rep_valid_pos & (1 << 20))) &&
+                                ((os[off].lit_max_pos & 0xFFFFF) >= L0 || (os[off].rep_valid_pos >= 0 && (os[off].rep_valid_pos & 0xFFFFF) >= L0))) {
+                                if (os[off].rep_valid_pos == pos - 1) os[off].rep_valid_pos = pos;
+                                match_steps++;
+                                continue;
+                            }
+                        } else if (match_steps >= max_match_steps && !(ws->lit_act64[off >> 6] & (1ULL << (off & 63)))) {
+                            match_steps++;
+                            continue;
+                        }
                     }
                     run1 = run0;
                     ml = compute_exact_ml_run_eq(input_data, run_start, last_match_pos, match_lengths, pos, off, L0, L1, run0);
                 }
 
                 match_steps++;
-                match_lengths[off] = ml;
-                last_match_pos[off] = pos;
+                if (ml > 2 || run0 >= 2) {
+                    match_lengths[off] = ml;
+                    last_match_pos[off] = pos;
+                }
+                int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
 
                 int is_req_off = (off == required_final_offset) || (req_bh_ff && off <= 256);
-                int min_base = lit_min_base[off];
-                int start_m = pos - ml;
-                int raw_max_p = lit_max_pos[off];
-                int max_p = raw_max_p & 0xFFFFF;
-
-                /* Lazily initialize rep_frontiers[off] at start_m on-demand if a literal run can end at start_m */
-                int rv_raw = rep_valid_pos[off];
-                int rv_pos = rv_raw & 0xFFFFF;
-                if (min_base < COST_INFINITY && max_p < start_m && (rv_raw < 0 || rv_pos < start_m)) {
-                    int rv_new = pos;
-                    int max_raw_m = (!is_req_off && best_any_cost[start_m] < COST_INFINITY)
-                                  ? (best_any_cost[start_m] - lit_cum_bits[start_m] + new_off_overhead[off] - 1)
-                                  : COST_INFINITY;
-                    if (min_base + 2 <= max_raw_m) {
-                        int min_elias = compute_elias_gamma_bits(start_m - max_p);
-                        if (min_base + 1 + min_elias <= max_raw_m) {
-                            int lit_src_node_m = -1;
-                            int raw_eval;
-                            if (!(raw_max_p & (1 << 20))) {
-                                raw_eval = min_base + 1 + min_elias;
-                                if (need_tokens && raw_eval <= max_raw_m) {
-                                    lit_src_node_m = lit_frontiers[off].entries[0].node_idx;
-                                }
-                            } else {
-                                raw_eval = frontier_evaluate_min(&lit_frontiers[off], start_m, &lit_src_node_m);
-                            }
-                            if (raw_eval <= max_raw_m) {
-                                int lit_cost_m = raw_eval + lit_cum_bits[start_m];
-                                int created_lit_node_m = need_tokens ? node_pool_push(pool, lit_src_node_m, start_m, 0) : 0;
-                                rep_frontiers[off].count = 1;
-                                rep_frontiers[off].entries[0].pos = start_m;
-                                rep_frontiers[off].entries[0].base_cost = lit_cost_m;
-                                rep_frontiers[off].entries[0].node_idx = created_lit_node_m;
-                                rv_new = pos | (1 << 20);
-                            }
-                        }
+                int prev_max_seen_ml = max_seen_ml;
+                int min_base = os[off].lit_min_base;
+                if (min_base == COST_INFINITY && ml <= prev_max_seen_ml && !is_req_off) {
+                    if ((!can_enter_lit && off > 256) || (off > dh_win_limit && (!can_enter_lit || match_steps > max_match_steps))) {
+                        continue;
                     }
-                    rep_valid_pos[off] = rv_new;
-                    rv_raw = rv_new;
-                } else if (rv_raw >= 0 && rv_pos >= start_m) {
-                    rv_raw = pos | (rv_raw & (1 << 20));
-                    rep_valid_pos[off] = rv_raw;
                 }
 
-                int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
                 int max_viable_mat = (!is_req_off && best_any_cost[pos] < COST_INFINITY)
-                                   ? (can_enter_lit ? (best_any_cost[pos] + new_off_overhead[off] + mat_pad) : (best_any_cost[pos] - 1))
+                                   ? (can_enter_lit ? (best_any_cost[pos] + os[off].new_off_overhead + mat_pad) : (best_any_cost[pos] - 1))
                                    : COST_INFINITY;
                 int mat_cost = COST_INFINITY;
                 int mat_prev_node = -1;
                 int is_rep_active = 0;
-                if (rv_raw == (pos | (1 << 20))) {
-                    const MonotonicFrontier *rf = &rep_frontiers[off];
-                    if (rf->entries[0].base_cost + 2 <= max_viable_mat) {
-                        int rep_cost = rf->entries[0].base_cost + 1 + compute_elias_gamma_bits(pos - rf->entries[0].pos);
-                        if (rep_cost <= max_viable_mat) {
-                            mat_cost = rep_cost;
-                            mat_prev_node = rf->entries[0].node_idx;
-                            is_rep_active = 1;
+                int max_p = 0;
+
+                if (min_base < COST_INFINITY) {
+                    int start_m = pos - ml;
+                    int raw_max_p = os[off].lit_max_pos;
+                    max_p = raw_max_p & 0xFFFFF;
+                    int rv_raw = os[off].rep_valid_pos;
+                    int rv_pos = rv_raw & 0xFFFFF;
+                    if (max_p < start_m && (rv_raw < 0 || rv_pos < start_m)) {
+                        int rv_new = pos;
+                        int max_raw_m = (!is_req_off && best_any_cost[start_m] < COST_INFINITY)
+                                      ? (best_any_cost[start_m] - lit_cum_bits[start_m] + os[off].new_off_overhead - 1)
+                                      : COST_INFINITY;
+                        if (min_base + 2 <= max_raw_m) {
+                            int min_elias = compute_elias_gamma_bits(start_m - max_p);
+                            if (min_base + 1 + min_elias <= max_raw_m) {
+                                int lit_src_node_m = -1;
+                                int raw_eval;
+                                if (!(raw_max_p & (1 << 20))) {
+                                    raw_eval = min_base + 1 + min_elias;
+                                    if (need_tokens && raw_eval <= max_raw_m) {
+                                        lit_src_node_m = lit_node0[off];
+                                    }
+                                } else {
+                                    raw_eval = frontier_evaluate_min(&lit_frontiers[off], start_m, &lit_src_node_m);
+                                }
+                                if (raw_eval <= max_raw_m) {
+                                    int lit_cost_m = raw_eval + lit_cum_bits[start_m];
+                                    int created_lit_node_m = need_tokens ? node_pool_push(pool, lit_src_node_m, start_m, 0) : 0;
+                                    rep_pos0[off] = start_m;
+                                    rep_cost0[off] = lit_cost_m;
+                                    rep_node0[off] = created_lit_node_m;
+                                    rv_new = pos | (1 << 20);
+                                }
+                            }
+                        }
+                        os[off].rep_valid_pos = rv_new;
+                        rv_raw = rv_new;
+                    } else if (rv_raw >= 0 && rv_pos >= start_m) {
+                        rv_raw = pos | (rv_raw & (1 << 20));
+                        os[off].rep_valid_pos = rv_raw;
+                    }
+
+                    if (rv_raw == (pos | (1 << 20))) {
+                        int r_bc = rep_cost0[off];
+                        if (r_bc + 2 <= max_viable_mat) {
+                            int rep_cost = r_bc + 1 + compute_elias_gamma_bits(pos - rep_pos0[off]);
+                            if (rep_cost <= max_viable_mat) {
+                                mat_cost = rep_cost;
+                                mat_prev_node = rep_node0[off];
+                                is_rep_active = 1;
+                            }
                         }
                     }
                 }
-                int prev_max_seen_ml = max_seen_ml;
+
                 if (ml <= prev_max_seen_ml && !is_rep_active && !is_req_off &&
                     ((!can_enter_lit && off > 256) || (off > dh_win_limit && (!can_enter_lit || (match_steps > max_match_steps && !(deep && min_base < COST_INFINITY && ml >= 3 && (pos - max_p) <= 2048)))))) {
                     continue;
@@ -1551,14 +1948,19 @@ static int solve_exact_parse(
                 }
 
                 if (ml >= MIN_MATCH_LENGTH_NEW_OFFSET && (can_enter_lit || is_req_off || ml > prev_max_seen_ml)) {
-                    int best_s = 0;
-                    int best_c = eval_best_new_offset_len(
-                        ws, best_any_cost, best_len_cost, best_len_start,
-                        &computed_best_len, &computed_bucket_idx, bucket_pref_cost, bucket_pref_start,
-                        pos, ml, &best_s
-                    );
+                    int best_s = 0, best_c;
+                    if (ml <= computed_best_len) {
+                        best_c = best_len_cost[ml];
+                        best_s = best_len_start[ml];
+                    } else {
+                        best_c = eval_best_new_offset_len(
+                            ws, best_any_cost, best_len_cost, best_len_start,
+                            &computed_best_len, &computed_bucket_idx, bucket_pref_cost, bucket_pref_start,
+                            pos, ml, &best_s
+                        );
+                    }
                     if (best_c < COST_INFINITY) {
-                        int new_off_cost = best_c + new_off_overhead[off];
+                        int new_off_cost = best_c + os[off].new_off_overhead;
                         if (new_off_cost < mat_cost) {
                             mat_cost = new_off_cost;
                             mat_prev_node = best_any_node[best_s];
@@ -1581,14 +1983,47 @@ static int solve_exact_parse(
                             best_mat_node_at_pos = created_mat_node;
                         }
                         if (enters_lit_frontier) {
-                            if (min_base == COST_INFINITY) lit_frontiers[off].count = 0;
-                            frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
-                            int new_mb = lit_frontiers[off].entries[0].base_cost;
-                            lit_min_base[off] = new_mb;
-                            if (new_mb < ws->lit_blk64_min[off >> 6]) {
-                                ws->lit_blk64_min[off >> 6] = new_mb;
+                            if (min_base == COST_INFINITY || mat_base_cost <= min_base) {
+                                os[off].lit_min_base = mat_base_cost;
+                                os[off].lit_max_pos = pos;
+                                lit_node0[off] = created_mat_node;
+                                ws->lit_act64[off >> 6] |= (1ULL << (off & 63));
+                                if (mat_base_cost < ws->lit_blk64_min[off >> 6]) {
+                                    ws->lit_blk64_min[off >> 6] = mat_base_cost;
+                                }
+                                if (mat_base_cost < ws->lit_blk8_min[off >> 3]) {
+                                    ws->lit_blk8_min[off >> 3] = mat_base_cost;
+                                }
+                            } else if ((mat_base_cost - min_base) <= 64) {
+                                int raw_mp = os[off].lit_max_pos;
+                                if (!(raw_mp & (1 << 20))) {
+                                    int last_delta = pos - raw_mp;
+                                    if (mat_base_cost - min_base < compute_elias_gamma_bits(last_delta + 1) - 1) {
+                                        lit_frontiers[off].count = 2;
+                                        lit_frontiers[off].entries[0].pos = raw_mp;
+                                        lit_frontiers[off].entries[0].base_cost = min_base;
+                                        lit_frontiers[off].entries[0].node_idx = lit_node0[off];
+                                        lit_frontiers[off].entries[1].pos = pos;
+                                        lit_frontiers[off].entries[1].base_cost = mat_base_cost;
+                                        lit_frontiers[off].entries[1].node_idx = created_mat_node;
+                                        os[off].lit_max_pos = pos | (1 << 20);
+                                    }
+                                } else {
+                                    frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
+                                    int new_mb = lit_frontiers[off].entries[0].base_cost;
+                                    os[off].lit_min_base = new_mb;
+                                    lit_node0[off] = lit_frontiers[off].entries[0].node_idx;
+                                    if (new_mb < ws->lit_blk64_min[off >> 6]) {
+                                        ws->lit_blk64_min[off >> 6] = new_mb;
+                                    }
+                                    if (new_mb < ws->lit_blk8_min[off >> 3]) {
+                                        ws->lit_blk8_min[off >> 3] = new_mb;
+                                    }
+                                    int fc = lit_frontiers[off].count;
+                                    int fp = lit_frontiers[off].entries[fc - 1].pos;
+                                    os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp;
+                                }
                             }
-                            { int fc = lit_frontiers[off].count; int fp = lit_frontiers[off].entries[fc - 1].pos; lit_max_pos[off] = (fc > 1) ? (fp | (1 << 20)) : fp; }
                         }
                     }
                 }
@@ -1599,36 +2034,38 @@ static int solve_exact_parse(
                 int idx1b = prev_same_byte[pos - 1];
                 int p1b_steps = 0;
                 int p1b_chain = 0;
-                int max_p1b_steps = deep ? ((input_size >= 8192 && best_any_cost[pos] > (pos << 2)) ? 128 : 32640) : 4;
-                int max_p1b_chain = deep ? (input_size < 8192 ? 32640 : 7168) : 8;
+                int max_p1b_steps = (deep == 2) ? (input_size <= 8192 ? 32 : 16) : (deep ? (input_size > 32768 ? 2048 : 32640) : 4);
+                int max_p1b_chain = (deep == 2) ? (input_size <= 8192 ? 128 : 64) : (deep ? (input_size < 8192 ? 32640 : 7168) : 8);
                 int prev_lit_bits = lit_cum_bits[pos - 1];
-                int is_high_ent_1b = (pos >= 64 && best_any_cost[pos] > (pos << 2));
+                int is_high_ent_1b = (deep == 1) && (input_size < 8192 || is_incomp);
                 int cur_pad_1b = is_high_ent_1b ? mat_pad : -2;
                 int max_any_raw_1b = (best_any_cost[pos] < COST_INFINITY)
-                                   ? (best_any_cost[pos] - prev_lit_bits + new_off_overhead[loop_max_off] + cur_pad_1b - 4)
+                                   ? (best_any_cost[pos] - prev_lit_bits + os[loop_max_off].new_off_overhead + cur_pad_1b - 4)
                                    : COST_INFINITY;
+                int use_swar_tail = ((deep == 1 || deep == 3) && !is_incomp && pos >= 2 && active_max_off >= 1024 && required_final_offset <= 0);
                 if (pos >= 2 && prv_byte == cur_byte) {
                     if (!cur_continues || run0 <= 3) {
                     if (cur_continues && (dh_mode == 0 || (cur_byte == 0 && dh_mode != 16)) && max_p1b_chain > 512) max_p1b_chain = 512;
                     int max_p1b_steps_1ba = (input_size >= 8192 && dh_mode == 0) ? 256 : max_p1b_steps;
+                    int chain_1ba_lim = use_swar_tail ? 96 : max_p1b_chain;
                     /* When cur_byte == prv_byte, only L2 = run_start[idx1b] has input_data[L2 - 1] != prv_byte */
                     while (idx1b >= min_idx1) {
-                        if (++p1b_chain > max_p1b_chain) break;
+                        if (++p1b_chain > chain_1ba_lim) break;
                         int L2 = run_start[idx1b];
                         if (L2 >= min_idx1) {
                             int off = (pos - 1) - L2;
                             int is_req_off = (off == required_final_offset);
-                            int min_base = lit_min_base[off];
+                            int min_base = os[off].lit_min_base;
                             if (!is_req_off && min_base > max_any_raw_1b) {
                                 idx1b = prev_same_byte[L2];
                                 continue;
                             }
-                            int raw_max_p = lit_max_pos[off];
+                            int raw_max_p = os[off].lit_max_pos;
                             int max_p = raw_max_p & 0xFFFFF;
                             if (max_p < pos - 1) {
                                 int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
                                 int max_viable_mat = (!is_req_off && best_any_cost[pos] < COST_INFINITY)
-                                                   ? (can_enter_lit ? (best_any_cost[pos] + new_off_overhead[off] + cur_pad_1b) : (best_any_cost[pos] - 1))
+                                                   ? (can_enter_lit ? (best_any_cost[pos] + os[off].new_off_overhead + cur_pad_1b) : (best_any_cost[pos] - 1))
                                                    : COST_INFINITY;
                                 if (min_base + 4 + prev_lit_bits <= max_viable_mat) {
                                     int min_elias = compute_elias_gamma_bits((pos - 1) - max_p);
@@ -1647,7 +2084,7 @@ static int solve_exact_parse(
                                                                           (is_req_off || ((mat_base_cost - min_base) <= f_pad));
                                                 if (rep_cost < best_any_cost[pos] || enters_lit_frontier) {
                                                     if (need_tokens && !(raw_max_p & (1 << 20))) {
-                                                        lit_src_node = lit_frontiers[off].entries[0].node_idx;
+                                                        lit_src_node = lit_node0[off];
                                                     }
                                                     int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos - 1, 0) : 0;
                                                     int created_mat_node = need_tokens ? node_pool_push(pool, created_lit_node, pos, off) : 0;
@@ -1661,16 +2098,49 @@ static int solve_exact_parse(
                                                         best_mat_cost_at_pos = rep_cost;
                                                         best_mat_node_at_pos = created_mat_node;
                                                     }
-                                                    if (enters_lit_frontier) {
-                                                        if (min_base == COST_INFINITY) lit_frontiers[off].count = 0;
-                                                        frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
-                                                        int new_mb = lit_frontiers[off].entries[0].base_cost;
-                                                        lit_min_base[off] = new_mb;
-                                                        if (new_mb < ws->lit_blk64_min[off >> 6]) {
-                                                            ws->lit_blk64_min[off >> 6] = new_mb;
-                                                        }
-                                                        { int fc = lit_frontiers[off].count; int fp = lit_frontiers[off].entries[fc - 1].pos; lit_max_pos[off] = (fc > 1) ? (fp | (1 << 20)) : fp; }
-                                                    }
+                        if (enters_lit_frontier) {
+                            if (min_base == COST_INFINITY || mat_base_cost <= min_base) {
+                                os[off].lit_min_base = mat_base_cost;
+                                os[off].lit_max_pos = pos;
+                                lit_node0[off] = created_mat_node;
+                                ws->lit_act64[off >> 6] |= (1ULL << (off & 63));
+                                if (mat_base_cost < ws->lit_blk64_min[off >> 6]) {
+                                    ws->lit_blk64_min[off >> 6] = mat_base_cost;
+                                }
+                                if (mat_base_cost < ws->lit_blk8_min[off >> 3]) {
+                                    ws->lit_blk8_min[off >> 3] = mat_base_cost;
+                                }
+                            } else if ((mat_base_cost - min_base) <= 64) {
+                                int raw_mp = os[off].lit_max_pos;
+                                if (!(raw_mp & (1 << 20))) {
+                                    int last_delta = pos - raw_mp;
+                                    if (mat_base_cost - min_base < compute_elias_gamma_bits(last_delta + 1) - 1) {
+                                        lit_frontiers[off].count = 2;
+                                        lit_frontiers[off].entries[0].pos = raw_mp;
+                                        lit_frontiers[off].entries[0].base_cost = min_base;
+                                        lit_frontiers[off].entries[0].node_idx = lit_node0[off];
+                                        lit_frontiers[off].entries[1].pos = pos;
+                                        lit_frontiers[off].entries[1].base_cost = mat_base_cost;
+                                        lit_frontiers[off].entries[1].node_idx = created_mat_node;
+                                        os[off].lit_max_pos = pos | (1 << 20);
+                                    }
+                                } else {
+                                    frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
+                                    int new_mb = lit_frontiers[off].entries[0].base_cost;
+                                    os[off].lit_min_base = new_mb;
+                                    lit_node0[off] = lit_frontiers[off].entries[0].node_idx;
+                                    if (new_mb < ws->lit_blk64_min[off >> 6]) {
+                                        ws->lit_blk64_min[off >> 6] = new_mb;
+                                    }
+                                    if (new_mb < ws->lit_blk8_min[off >> 3]) {
+                                        ws->lit_blk8_min[off >> 3] = new_mb;
+                                    }
+                                    int fc = lit_frontiers[off].count;
+                                    int fp = lit_frontiers[off].entries[fc - 1].pos;
+                                    os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp;
+                                }
+                            }
+                        }
                                                 }
                                             }
                                         }
@@ -1680,10 +2150,22 @@ static int solve_exact_parse(
                         }
                         idx1b = prev_same_byte[L2];
                     }
+                    if (use_swar_tail && p1b_chain > chain_1ba_lim && idx1b >= min_idx1 && p1b_steps < max_p1b_steps_1ba) {
+                        int L2_next = run_start[idx1b];
+                        if (L2_next >= min_idx1) {
+                            eval_1b_swar_tail(
+                                ws, input_data, input_size, pos, (pos - 1) - L2_next, active_max_off,
+                                cur_byte, prv_byte, nxt_byte, max_any_raw_1b, prev_lit_bits, literal_pos_bits,
+                                cur_pad_1b, f_pad, need_tokens, best_any_cost, best_any_node,
+                                &best_mat_cost_at_pos, &best_mat_node_at_pos
+                            );
+                        }
+                    }
                     }
                 } else {
+                    int chain_1bb_lim = use_swar_tail ? ((cur_byte == 0 || cur_byte == 0x20) ? 96 : 384) : max_p1b_chain;
                     while (idx1b >= min_idx1) {
-                        if (++p1b_chain > max_p1b_chain) break;
+                        if (++p1b_chain > chain_1bb_lim) break;
                         int cur_idx1b = idx1b;
                         idx1b = prev_same_byte[cur_idx1b];
                         int L2 = run_start[cur_idx1b];
@@ -1693,37 +2175,47 @@ static int solve_exact_parse(
                             int lim_s = (best_any_cost[pos] < COST_INFINITY)
                                       ? (scan_can_lit ? max_any_raw_1b : (best_any_cost[pos] - prev_lit_bits - 5))
                                       : COST_INFINITY;
-                            while (scan >= L2) {
+                            int scan_min = (L2 > min_idx1) ? L2 : min_idx1;
+                            while (scan >= scan_min) {
                                 int off_s = (pos - 1) - scan;
                                 int b64_s = off_s >> 6;
                                 int blk_end_s = (pos - 1) - ((b64_s << 6) | 63);
-                                if (blk_end_s >= L2 &&
-                                    (required_final_offset <= 0 || (required_final_offset >> 6) != b64_s) &&
-                                    ws->lit_blk64_min[b64_s] > lim_s) {
-                                    scan = blk_end_s - 1;
-                                    continue;
+                                if (required_final_offset <= 0 || (required_final_offset >> 6) != b64_s) {
+                                    if (ws->lit_blk64_min[b64_s] > lim_s) {
+                                        scan = blk_end_s - 1;
+                                        continue;
+                                    }
+                                    uint64_t act_m = ws->lit_act64[b64_s] >> (off_s & 63);
+                                    if (!act_m) {
+                                        scan = blk_end_s - 1;
+                                        continue;
+                                    }
+                                    int tz = __builtin_ctzll(act_m);
+                                    scan -= tz;
+                                    if (scan < scan_min) break;
+                                    off_s += tz;
                                 }
-                                if (off_s == required_final_offset || lit_min_base[off_s] <= lim_s) {
+                                if (off_s == required_final_offset || (os[off_s].lit_min_base <= lim_s && (os[off_s].lit_max_pos & 0xFFFFF) < pos - 1)) {
                                     break;
                                 }
                                 scan--;
                             }
-                            idx1b = (scan >= L2) ? scan : prev_same_byte[L2];
+                            idx1b = (scan >= scan_min) ? scan : prev_same_byte[L2];
                         }
                         int off = (pos - 1) - cur_idx1b;
                         int is_req_off = (off == required_final_offset);
-                        int min_base = lit_min_base[off];
+                        int min_base = os[off].lit_min_base;
                         if (!is_req_off && min_base > max_any_raw_1b) {
                             continue;
                         }
-                        int raw_max_p = lit_max_pos[off];
+                        int raw_max_p = os[off].lit_max_pos;
                         int max_p = raw_max_p & 0xFFFFF;
                         if (max_p >= pos - 1 || (cur_idx1b > 0 && input_data[cur_idx1b - 1] == prv_byte)) {
                             continue;
                         }
                         int can_enter_lit = (pos < input_size && input_data[pos - off] != nxt_byte);
                         int max_viable_mat = (!is_req_off && best_any_cost[pos] < COST_INFINITY)
-                                           ? (can_enter_lit ? (best_any_cost[pos] + new_off_overhead[off] + cur_pad_1b) : (best_any_cost[pos] - 1))
+                                           ? (can_enter_lit ? (best_any_cost[pos] + os[off].new_off_overhead + cur_pad_1b) : (best_any_cost[pos] - 1))
                                            : COST_INFINITY;
                         if (min_base + 4 + prev_lit_bits > max_viable_mat) {
                             continue;
@@ -1747,7 +2239,7 @@ static int solve_exact_parse(
                                                           (is_req_off || ((mat_base_cost - min_base) <= f_pad));
                                 if (rep_cost < best_any_cost[pos] || enters_lit_frontier) {
                                     if (need_tokens && !(raw_max_p & (1 << 20))) {
-                                        lit_src_node = lit_frontiers[off].entries[0].node_idx;
+                                        lit_src_node = lit_node0[off];
                                     }
                                     int created_lit_node = need_tokens ? node_pool_push(pool, lit_src_node, pos - 1, 0) : 0;
                                     int created_mat_node = need_tokens ? node_pool_push(pool, created_lit_node, pos, off) : 0;
@@ -1761,23 +2253,82 @@ static int solve_exact_parse(
                                         best_mat_cost_at_pos = rep_cost;
                                         best_mat_node_at_pos = created_mat_node;
                                     }
-                                    if (enters_lit_frontier) {
-                                        if (min_base == COST_INFINITY) lit_frontiers[off].count = 0;
-                                        frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
-                                        int new_mb = lit_frontiers[off].entries[0].base_cost;
-                                        lit_min_base[off] = new_mb;
-                                        if (new_mb < ws->lit_blk64_min[off >> 6]) {
-                                            ws->lit_blk64_min[off >> 6] = new_mb;
-                                        }
-                                        { int fc = lit_frontiers[off].count; int fp = lit_frontiers[off].entries[fc - 1].pos; lit_max_pos[off] = (fc > 1) ? (fp | (1 << 20)) : fp; }
+                        if (enters_lit_frontier) {
+                            if (min_base == COST_INFINITY || mat_base_cost <= min_base) {
+                                os[off].lit_min_base = mat_base_cost;
+                                os[off].lit_max_pos = pos;
+                                lit_node0[off] = created_mat_node;
+                                ws->lit_act64[off >> 6] |= (1ULL << (off & 63));
+                                if (mat_base_cost < ws->lit_blk64_min[off >> 6]) {
+                                    ws->lit_blk64_min[off >> 6] = mat_base_cost;
+                                }
+                                if (mat_base_cost < ws->lit_blk8_min[off >> 3]) {
+                                    ws->lit_blk8_min[off >> 3] = mat_base_cost;
+                                }
+                            } else if ((mat_base_cost - min_base) <= 64) {
+                                int raw_mp = os[off].lit_max_pos;
+                                if (!(raw_mp & (1 << 20))) {
+                                    int last_delta = pos - raw_mp;
+                                    if (mat_base_cost - min_base < compute_elias_gamma_bits(last_delta + 1) - 1) {
+                                        lit_frontiers[off].count = 2;
+                                        lit_frontiers[off].entries[0].pos = raw_mp;
+                                        lit_frontiers[off].entries[0].base_cost = min_base;
+                                        lit_frontiers[off].entries[0].node_idx = lit_node0[off];
+                                        lit_frontiers[off].entries[1].pos = pos;
+                                        lit_frontiers[off].entries[1].base_cost = mat_base_cost;
+                                        lit_frontiers[off].entries[1].node_idx = created_mat_node;
+                                        os[off].lit_max_pos = pos | (1 << 20);
                                     }
+                                } else {
+                                    frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
+                                    int new_mb = lit_frontiers[off].entries[0].base_cost;
+                                    os[off].lit_min_base = new_mb;
+                                    lit_node0[off] = lit_frontiers[off].entries[0].node_idx;
+                                    if (new_mb < ws->lit_blk64_min[off >> 6]) {
+                                        ws->lit_blk64_min[off >> 6] = new_mb;
+                                    }
+                                    if (new_mb < ws->lit_blk8_min[off >> 3]) {
+                                        ws->lit_blk8_min[off >> 3] = new_mb;
+                                    }
+                                    int fc = lit_frontiers[off].count;
+                                    int fp = lit_frontiers[off].entries[fc - 1].pos;
+                                    os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp;
+                                }
+                            }
+                        }
                                 }
                             }
                         }
                     }
+                    if (use_swar_tail && p1b_chain > chain_1bb_lim && idx1b >= min_idx1 && p1b_steps < max_p1b_steps) {
+                        eval_1b_swar_tail(
+                            ws, input_data, input_size, pos, (pos - 1) - idx1b, active_max_off,
+                            cur_byte, prv_byte, nxt_byte, max_any_raw_1b, prev_lit_bits, literal_pos_bits,
+                            cur_pad_1b, f_pad, need_tokens, best_any_cost, best_any_node,
+                            &best_mat_cost_at_pos, &best_mat_node_at_pos
+                        );
+                    }
                 }
             }
         } else {
+            if (wildcard_mask == NULL) {
+                for (int o = 1; o <= max_window; o++) {
+                    if (os[o].lit_min_base < COST_INFINITY && !(os[o].lit_max_pos & (1 << 20))) {
+                        lit_frontiers[o].count = 1;
+                        lit_frontiers[o].entries[0].pos = os[o].lit_max_pos;
+                        lit_frontiers[o].entries[0].base_cost = os[o].lit_min_base;
+                        lit_frontiers[o].entries[0].node_idx = lit_node0[o];
+                    }
+                    if (os[o].rep_valid_pos >= 0 && (os[o].rep_valid_pos & (1 << 20))) {
+                        rep_frontiers[o].count = 1;
+                        rep_frontiers[o].entries[0].pos = rep_pos0[o];
+                        rep_frontiers[o].entries[0].base_cost = rep_cost0[o];
+                        rep_frontiers[o].entries[0].node_idx = rep_node0[o];
+                    } else {
+                        rep_frontiers[o].count = 0;
+                    }
+                }
+            }
             uint8_t cur_byte = input_data[pos - 1];
             uint8_t nxt_byte = (pos < input_size) ? input_data[pos] : 0;
             int off_lo = 1;
@@ -1814,9 +2365,7 @@ static int solve_exact_parse(
                         } else if (run1 > run0) {
                             ml = run0;
                         } else {
-                            ml = (last_match_pos[off] >= L0)
-                               ? (match_lengths[off] + (pos - last_match_pos[off]))
-                               : run0;
+                            ml = compute_exact_ml_run_eq(input_data, run_start, last_match_pos, match_lengths, pos, off, L0, L1, run0);
                         }
                     } else {
                         ml = (last_match_pos[off] == pos - 1) ? (match_lengths[off] + 1) : 1;
@@ -1825,9 +2374,9 @@ static int solve_exact_parse(
                     last_match_pos[off] = pos;
                     if (wildcard_mask == NULL) {
                         int start_m = pos - ml;
-                        int rv_raw = rep_valid_pos[off];
+                        int rv_raw = os[off].rep_valid_pos;
                         int rv_pos = rv_raw & 0xFFFFF;
-                        if (lit_min_base[off] < COST_INFINITY && (lit_max_pos[off] & 0xFFFFF) < start_m && (rv_raw < 0 || rv_pos < start_m)) {
+                        if (os[off].lit_min_base < COST_INFINITY && (os[off].lit_max_pos & 0xFFFFF) < start_m && (rv_raw < 0 || rv_pos < start_m)) {
                             int lit_src_node_m = -1;
                             int raw_eval = frontier_evaluate_min(&lit_frontiers[off], start_m, &lit_src_node_m);
                             if (raw_eval < COST_INFINITY) {
@@ -1837,17 +2386,17 @@ static int solve_exact_parse(
                                 rep_frontiers[off].entries[0].pos = start_m;
                                 rep_frontiers[off].entries[0].base_cost = lit_cost_m;
                                 rep_frontiers[off].entries[0].node_idx = created_lit_node_m;
-                                rep_valid_pos[off] = pos | (1 << 20);
+                                os[off].rep_valid_pos = pos | (1 << 20);
                                 is_rep_active = 1;
                             } else {
-                                rep_valid_pos[off] = pos;
+                                os[off].rep_valid_pos = pos;
                             }
                         } else if (rv_raw >= 0 && rv_pos >= start_m) {
                             is_rep_active = (rv_raw & (1 << 20)) != 0;
-                            rep_valid_pos[off] = pos | (rv_raw & (1 << 20));
+                            os[off].rep_valid_pos = pos | (rv_raw & (1 << 20));
                         }
-                    } else if (rep_valid_pos[off] == pos - 1) {
-                        rep_valid_pos[off] = pos;
+                    } else if (os[off].rep_valid_pos == pos - 1) {
+                        os[off].rep_valid_pos = pos;
                         is_rep_active = 1;
                     }
                 } else {
@@ -1856,7 +2405,7 @@ static int solve_exact_parse(
                     }
                 }
 
-                int min_base = lit_min_base[off];
+                int min_base = os[off].lit_min_base;
 
                 /* 1. Evaluate Literal run ending at pos only when needed for LAST_OFFSET or EOF */
                 int lit_src_node = -1;
@@ -1895,7 +2444,7 @@ static int solve_exact_parse(
                         pos, ml, &best_s
                     );
                     if (best_c < COST_INFINITY) {
-                        int new_off_cost = best_c + new_off_overhead[off];
+                        int new_off_cost = best_c + os[off].new_off_overhead;
                         if (new_off_cost < mat_cost) {
                             mat_cost = new_off_cost;
                             mat_prev_node = best_any_node[best_s];
@@ -1922,11 +2471,11 @@ static int solve_exact_parse(
                             if (min_base == COST_INFINITY) lit_frontiers[off].count = 0;
                             frontier_push(&lit_frontiers[off], pos, mat_base_cost, created_mat_node);
                             int new_mb = lit_frontiers[off].entries[0].base_cost;
-                            lit_min_base[off] = new_mb;
+                            os[off].lit_min_base = new_mb;
                             if (new_mb < ws->lit_blk64_min[off >> 6]) {
                                 ws->lit_blk64_min[off >> 6] = new_mb;
                             }
-                            { int fc = lit_frontiers[off].count; int fp = lit_frontiers[off].entries[fc - 1].pos; lit_max_pos[off] = (fc > 1) ? (fp | (1 << 20)) : fp; }
+                            { int fc = lit_frontiers[off].count; int fp = lit_frontiers[off].entries[fc - 1].pos; os[off].lit_max_pos = (fc > 1) ? (fp | (1 << 20)) : fp; }
                         }
                     }
                 }
@@ -1934,18 +2483,18 @@ static int solve_exact_parse(
                 /* Push literal state after match evaluation so LAST_OFFSET matches have length >= 1 */
                 if (created_lit_node >= 0 && next_pos_matches) {
                     if (wildcard_mask == NULL) {
-                        if (rep_valid_pos[off] != (pos | (1 << 20))) {
+                        if (os[off].rep_valid_pos != (pos | (1 << 20))) {
                             rep_frontiers[off].count = 0;
                         }
                         frontier_push(&rep_frontiers[off], pos, lit_cost, created_lit_node);
-                        rep_valid_pos[off] = (rep_frontiers[off].count > 0) ? (pos | (1 << 20)) : pos;
+                        os[off].rep_valid_pos = (rep_frontiers[off].count > 0) ? (pos | (1 << 20)) : pos;
                     } else {
-                        if (rep_valid_pos[off] != pos) {
+                        if (os[off].rep_valid_pos != pos) {
                             rep_frontiers[off].count = 0;
                         }
                         frontier_push(&rep_frontiers[off], pos, lit_cost, created_lit_node);
                         if (rep_frontiers[off].count > 0) {
-                            rep_valid_pos[off] = pos;
+                            os[off].rep_valid_pos = pos;
                         }
                     }
                 }
@@ -1961,8 +2510,8 @@ static int solve_exact_parse(
 
         if (best_mat_cost_at_pos < COST_INFINITY) {
             frontier_push(&lit_frontiers[0], pos, best_mat_cost_at_pos - literal_pos_bits, best_mat_node_at_pos);
-            lit_min_base[0] = lit_frontiers[0].entries[0].base_cost;
-            lit_max_pos[0] = pos;
+            os[0].lit_min_base = lit_frontiers[0].entries[0].base_cost;
+            os[0].lit_max_pos = pos;
         }
     }
 
@@ -3008,6 +3557,53 @@ static void reconstruct_filtered_buffer(
 
 int g_single_e8_only = 0;
 
+static UltraMetadata g_top_cands[8];
+static size_t g_top_sizes[8];
+static int g_n_top_cands = 0;
+
+static int same_filter_shape(const UltraMetadata *a, const UltraMetadata *b) {
+    if (a->filter_passes != b->filter_passes) return 0;
+    for (int i = 0; i < a->filter_passes; i++) {
+        if (a->filter_strides[i] != b->filter_strides[i] ||
+            a->filter_counts[i] != b->filter_counts[i] ||
+            a->filter_word_modes[i] != b->filter_word_modes[i]) return 0;
+    }
+    return 1;
+}
+
+static void record_top_cand(const UltraMetadata *m, size_t csize) {
+    for (int i = 0; i < g_n_top_cands; i++) {
+        if (same_filter_shape(&g_top_cands[i], m)) {
+            if (csize < g_top_sizes[i] || (csize == g_top_sizes[i] && m->compressed_bits < g_top_cands[i].compressed_bits)) {
+                g_top_cands[i] = *m;
+                g_top_sizes[i] = csize;
+                while (i > 0 && (g_top_sizes[i] < g_top_sizes[i-1] ||
+                       (g_top_sizes[i] == g_top_sizes[i-1] && g_top_cands[i].compressed_bits < g_top_cands[i-1].compressed_bits))) {
+                    UltraMetadata tm = g_top_cands[i]; g_top_cands[i] = g_top_cands[i-1]; g_top_cands[i-1] = tm;
+                    size_t ts = g_top_sizes[i]; g_top_sizes[i] = g_top_sizes[i-1]; g_top_sizes[i-1] = ts;
+                    i--;
+                }
+            }
+            return;
+        }
+    }
+    int pos = g_n_top_cands;
+    if (pos < 8) {
+        g_n_top_cands++;
+    } else {
+        if (csize > g_top_sizes[7] || (csize == g_top_sizes[7] && m->compressed_bits >= g_top_cands[7].compressed_bits)) return;
+        pos = 7;
+    }
+    g_top_cands[pos] = *m;
+    g_top_sizes[pos] = csize;
+    while (pos > 0 && (g_top_sizes[pos] < g_top_sizes[pos-1] ||
+           (g_top_sizes[pos] == g_top_sizes[pos-1] && g_top_cands[pos].compressed_bits < g_top_cands[pos-1].compressed_bits))) {
+        UltraMetadata tm = g_top_cands[pos]; g_top_cands[pos] = g_top_cands[pos-1]; g_top_cands[pos-1] = tm;
+        size_t ts = g_top_sizes[pos]; g_top_sizes[pos] = g_top_sizes[pos-1]; g_top_sizes[pos-1] = ts;
+        pos--;
+    }
+}
+
 static int evaluate_candidate_meta(
     const uint8_t *buf,
     int input_size,
@@ -3039,6 +3635,7 @@ static int evaluate_candidate_meta(
     }
     #pragma omp critical
     {
+        if (tls_deep_mode < 0) record_top_cand(cand_meta, csize);
         if (csize < *best_size_io ||
             (csize == *best_size_io && bits < best_meta_io->compressed_bits)) {
             *best_size_io = csize;
@@ -3097,16 +3694,30 @@ uint8_t *ultra_compress_buffer(
     best_meta.format = format;
     best_meta.offset_lsb_bits = ZX0_DEFAULT_LSB_BITS;
 
+    int top_level_call = !omp_in_parallel();
     if (format == ULTRA_FORMAT_ZX0_V2) {
-        g_deep_mode = 1;
+        if (top_level_call) g_deep_mode = 1; else tls_deep_mode = 1;
         ParsePlan plan = {NULL, 0, 0};
         int ok = solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan);
         assert(ok);
+        if (input_size > 32768 && plan.payload_bits > 90000 && (plan.payload_bits & 7) >= 6) {
+            if (top_level_call) g_deep_mode = 3; else tls_deep_mode = 3;
+            ParsePlan plan3 = {NULL, 0, 0};
+            if (solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &plan3)) {
+                if (plan3.payload_bits < plan.payload_bits) {
+                    free(plan.tokens);
+                    plan = plan3;
+                } else {
+                    free(plan3.tokens);
+                }
+            }
+            if (top_level_call) g_deep_mode = 1; else tls_deep_mode = 1;
+        }
         best_meta.compressed_bits = plan.payload_bits;
         best_stream = encode_plan_to_stream(working_input, &plan, format, ZX0_DEFAULT_LSB_BITS, &best_meta, &best_size);
         free(plan.tokens);
     } else if (format == ULTRA_FORMAT_ADPK_77B) {
-        g_deep_mode = (input_size < 8192);
+        if (top_level_call) { g_n_top_cands = 0; g_deep_mode = 0; } else tls_deep_mode = 0;
         #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
         for (int k = 1; k <= MAX_ADPK_LSB_BITS; k++) {
             if (k > 2 && (1 << (k - 1)) >= input_size * 2) {
@@ -3118,7 +3729,7 @@ uint8_t *ultra_compress_buffer(
             cand_meta.offset_lsb_bits = k;
             evaluate_candidate_meta(working_input, input_size, format, k, effective_limit, 0, &cand_meta, &best_size, &best_meta, NULL);
         }
-        g_deep_mode = 1;
+        if (top_level_call) g_deep_mode = 1; else tls_deep_mode = 1;
         ParsePlan dplan = {NULL, 0, 0};
         int ok = solve_exact_parse(working_input, input_size, NULL, best_meta.offset_lsb_bits, effective_limit, 0, &dplan);
         assert(ok);
@@ -3137,7 +3748,7 @@ uint8_t *ultra_compress_buffer(
          * - ULTRA_FORMAT_PRO_111B   (Zero-overhead ZX0 + E8/E9 + 16-bit Word/Byte-ADD 2D filter)
          * - ULTRA_FORMAT_ULTRA_128B (Flagship 128B: Packed Header + 4..8-bit Literals + E8/E9 + 16-bit Word/Byte-ADD 2D filter)
          */
-        g_deep_mode = (input_size < 8192);
+        if (top_level_call) { g_n_top_cands = 0; g_deep_mode = 0; } else tls_deep_mode = 0;
         int is_word_capable = (format == ULTRA_FORMAT_ULTRA_128B || format == ULTRA_FORMAT_PRO_111B);
         int is_multi_stage  = (format == ULTRA_FORMAT_HYBRID_108B || is_word_capable);
         int base_req_off = (format == ULTRA_FORMAT_ULTRA_128B) ? -200 : 0;
@@ -3514,7 +4125,7 @@ uint8_t *ultra_compress_buffer(
                     );
 
                     memcpy(cur_buf, working_input, (size_t)input_size);
-                    int stride_max_passes = (stride <= 32) ? max_passes : 1;
+                    int stride_max_passes = (stride <= 2 || si == 0) ? max_passes : ((si == 1 && stride <= 32) ? 2 : 1);
                     for (int pass = 1; pass <= stride_max_passes; pass++) {
                         if (input_size <= pass * stride) {
                             break;
@@ -4051,7 +4662,7 @@ uint8_t *ultra_compress_buffer(
             }
 
             /* C0. PRO_111B & ULTRA_128B Native 16-Bit Word-Stride-Delta Search (eliminates carry-ripple on 16-bit PCM/Coord/Ptr tables) */
-            if (is_word_capable && input_size >= 4 && best_meta.compressed_bits > 200) {
+            if (is_word_capable && input_size >= 4 && best_meta.compressed_bits > 64) {
                 static const int word_strides[] = {
                     2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
                     32, 36, 40, 48, 52, 60, 64, 72, 80, 96, 100, 112, 120, 128
@@ -4124,7 +4735,7 @@ uint8_t *ultra_compress_buffer(
                         }
 
                         memcpy(wcur, working_input, (size_t)input_size);
-                        int max_wpasses = 4;
+                        int max_wpasses = (wi <= 1 || wstride <= 8) ? 4 : 2;
                         int prev_eq_wb = 0;
                         for (int k = wstride; k + 1 < input_size; k += 2) {
                             if (working_input[k] == 0 || working_input[k] == working_input[k - wstride]) prev_eq_wb++;
@@ -4147,11 +4758,11 @@ uint8_t *ultra_compress_buffer(
                                 if (wcur[k + 1] == 0 || wcur[k + 1] == 0xFFu) { eq_cur_hi++; cur_eq_wb++; }
                                 else if (wcur[k + 1] == wcur[k + 1 - wstride]) cur_eq_wb++;
                             }
-                            if (pass >= 2 && cur_eq_wb <= prev_eq_wb) {
+                            if (pass >= 2 && wstride > 2 && cur_eq_wb <= prev_eq_wb) {
                                 break;
                             }
                             prev_eq_wb = cur_eq_wb;
-                            if (eq_cur_hi <= eq_raw_hi + (input_size / 32)) {
+                            if (wstride > 2 && eq_cur_hi <= eq_raw_hi + (input_size / 32)) {
                                 continue;
                             }
                             UltraMetadata meta_w;
@@ -4175,7 +4786,7 @@ uint8_t *ultra_compress_buffer(
 
                         if (wstride <= 32) {
                             memcpy(wcur, working_input, (size_t)input_size);
-                            int max_hyb_wpass = 2;
+                            int max_hyb_wpass = (wstride <= 2) ? 3 : 2;
                             for (int wpass = 1; wpass <= max_hyb_wpass; wpass++) {
                                 int whc = (input_size - wpass * wstride) & ~1;
                                 if (whc < 2 || whc > 65534) break;
@@ -4490,7 +5101,7 @@ uint8_t *ultra_compress_buffer(
 
                     for (int i2 = 0; i2 < n_s2; i2++) {
                         int s2 = pair_s2[i2];
-                        if (s2 == s1 || s2 >= input_size || s2 > max_allowed_stride) continue;
+                        if (s2 == s1 || (input_size >= 8192 && s2 < s1) || s2 >= input_size || s2 > max_allowed_stride) continue;
                         if (s1 > 4 && (s2 % s1 != 0) && (s1 % s2 != 0) && s2 != s1 + 2 && s1 != s2 + 2) continue;
                         int c2 = (input_size - s2) > 65535 ? 65535 : (input_size - s2);
                         apply_forward_stride_difference(buf_p1, buf_p2, input_size, s2, c2);
@@ -5357,13 +5968,14 @@ uint8_t *ultra_compress_buffer(
          * if unfiltered remains competitive) and evaluate the top candidates in parallel.
          */
         if (format == ULTRA_FORMAT_ULTRA_128B && (input_size < 4096 || base_payload_bits > 256)) {
-            int max_dh_cands = (input_size >= 8192) ? 4 : 12;
+            if (top_level_call) g_deep_mode = (input_size <= 32768) ? 2 : 0; else tls_deep_mode = (input_size <= 32768) ? 2 : 0;
+            int max_dh_cands = (input_size >= 8192) ? 8 : 12;
             if (!defer_uni && best_meta.filter_passes == 0) {
                 int raw_est_dh = find_best_dh_sentinel(working_input, input_size, NULL);
                 int uniq_dhs[16];
-                int n_uniq = rank_top_dh_sentinels(working_input, input_size, raw_est_dh, uniq_dhs, max_dh_cands);
+                int n_uniq = rank_top_dh_sentinels(working_input, input_size, -1, uniq_dhs, max_dh_cands);
                 ParsePlan ref_plan8 = {NULL, 0, 0};
-                if (input_size < 8192 && solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &ref_plan8)) {
+                if (0 && solve_exact_parse(working_input, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &ref_plan8)) {
                     int plan_dhs[6];
                     int np = rank_top_dh_sentinels_from_plan(working_input, input_size, &ref_plan8, plan_dhs, 6);
                     for (int pi = 0; pi < np && n_uniq < 16; pi++) {
@@ -5392,7 +6004,7 @@ uint8_t *ultra_compress_buffer(
                 }
             }
 
-            if (best_meta.filter_passes > 0 && (input_size < 8192 || best_meta.filter_passes <= 4)) {
+            if (best_meta.filter_passes > 0) {
                 uint8_t *f_cur = (uint8_t *)malloc((size_t)input_size);
                 uint8_t *f_nxt = (uint8_t *)malloc((size_t)input_size);
                 assert(f_cur != NULL && f_nxt != NULL);
@@ -5403,9 +6015,9 @@ uint8_t *ultra_compress_buffer(
                     best_meta.dh_sentinel = est_dh;
                 }
                 int uniq_ref_dhs[16];
-                int n_ref_dhs = rank_top_dh_sentinels(f_cur, input_size, est_dh, uniq_ref_dhs, max_dh_cands);
+                int n_ref_dhs = rank_top_dh_sentinels(f_cur, input_size, -1, uniq_ref_dhs, max_dh_cands);
                 ParsePlan f_plan8 = {NULL, 0, 0};
-                if (input_size < 8192 && solve_exact_parse(f_cur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &f_plan8)) {
+                if (0 && solve_exact_parse(f_cur, input_size, NULL, ZX0_DEFAULT_LSB_BITS, effective_limit, 0, &f_plan8)) {
                     int plan_dhs[6];
                     int np = rank_top_dh_sentinels_from_plan(f_cur, input_size, &f_plan8, plan_dhs, 6);
                     for (int pi = 0; pi < np && n_ref_dhs < 16; pi++) {
@@ -5442,10 +6054,17 @@ uint8_t *ultra_compress_buffer(
          * parallel OpenMP pass directly producing ParsePlan tokens (zero duplicate best_meta parse!),
          * refine DH on the finalized token plan for ULTRA_128B, and emit the winning stream.
          */
-        g_deep_mode = 1;
-        UltraMetadata deep_cands[4];
+        if (top_level_call) g_deep_mode = 1; else tls_deep_mode = 1;
+        UltraMetadata deep_cands[8];
         int n_deep = 0;
         deep_cands[n_deep++] = best_meta;
+        if (top_level_call && input_size < 8192) {
+            for (int ti = 0; ti < g_n_top_cands && n_deep < 4; ti++) {
+                if (!same_filter_shape(&g_top_cands[ti], &best_meta) && g_top_sizes[ti] <= best_size + 4) {
+                    deep_cands[n_deep++] = g_top_cands[ti];
+                }
+            }
+        }
 
 
 
@@ -5454,7 +6073,7 @@ uint8_t *ultra_compress_buffer(
                             (best_meta.filter_stride == 1) &&
                             best_meta.filter_word_modes[0] == 0 &&
                             best_meta.filter_counts[0] >= input_size - 2);
-        int need_alt_q3 = ((best_meta.filter_passes == 6) &&
+        int need_alt_q3 = ((best_meta.filter_passes == 5 || best_meta.filter_passes == 6) &&
                            best_meta.filter_strides[0] == 0 &&
                            best_meta.filter_word_modes[1] == 1 &&
                            best_meta.filter_word_modes[best_meta.filter_passes - 1] == 0);
@@ -5525,8 +6144,8 @@ uint8_t *ultra_compress_buffer(
             }
         }
 
-        ParsePlan deep_plans[4];
-        size_t deep_sizes[4];
+        ParsePlan deep_plans[8];
+        size_t deep_sizes[8];
         for (int di = 0; di < n_deep; di++) {
             deep_plans[di].tokens = NULL;
             deep_plans[di].token_count = 0;
@@ -5609,6 +6228,7 @@ uint8_t *ultra_compress_buffer(
     free(verified);
     free(working_input);
 
+    if (!top_level_call) tls_deep_mode = -1;
     *compressed_size_out = best_size;
     if (metadata_out != NULL) {
         *metadata_out = best_meta;
